@@ -1,0 +1,11 @@
+{
+  "name": "strategy-demo",
+  "version": "1.0.0",
+  "kind": "strategy",
+  "hooks": [],
+  "permissions": {
+    "context": false,
+    "capabilities": ["device:buzzer"]
+  },
+  "signature": null
+}

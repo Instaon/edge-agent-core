@@ -1,0 +1,14 @@
+{
+  "context_max_bytes": 65536,
+  "max_format_retries": 2,
+  "breaker_max_failures": 3,
+  "breaker_max_repeats": 3,
+  "plugin_fuel": 50000000,
+  "plugin_memory_limit": 16777216,
+  "plugin_max_failures": 3,
+  "plugins_dir": "plugins",
+  "trusted_pubkey": null,
+  "repair_plugin": null,
+  "dev_allow_unsigned": true,
+  "backend": { "type": "mock" }
+}
