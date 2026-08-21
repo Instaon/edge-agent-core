@@ -38,11 +38,30 @@ pub enum BackendConfig {
     /// Deterministic echo backend, useful without any model installed.
     Mock,
     /// Any local/LAN service speaking the OpenAI chat-completions protocol.
+    /// Multimodal (text+image) via standard `image_url` content parts.
     Openai {
         url: String,
         model: String,
         #[serde(default)]
         api_key: Option<String>,
+    },
+    /// On-device inference via Google AI Edge's LiteRT-LM runtime, driven
+    /// through the `litert_lm_main` CLI (or a flag-compatible wrapper).
+    LitertLm {
+        /// Path to the litert_lm_main executable.
+        binary: String,
+        /// Path to the .litertlm / .task model bundle.
+        model_path: String,
+        /// Maps to litert_lm's `--backend` flag: "cpu" | "gpu" | "npu".
+        #[serde(default)]
+        accelerator: Option<String>,
+        /// Flag used to pass image files (e.g. "--image_path"). Without it,
+        /// image inputs are rejected with a clear error, never dropped.
+        #[serde(default)]
+        image_arg: Option<String>,
+        /// Extra flags appended verbatim.
+        #[serde(default)]
+        extra_args: Vec<String>,
     },
     /// Inference delegated to a wasm plugin: model access is just another
     /// replaceable runtime part. The plugin reaches its engine through
@@ -124,7 +143,36 @@ mod tests {
             _ => panic!("expected openai backend"),
         }
 
-        // 3. Plugin Backend
+        // 3. LiteRT-LM Backend
+        let json_litert = r#"{
+            "backend": {
+                "type": "litert_lm",
+                "binary": "/usr/local/bin/litert_lm_main",
+                "model_path": "/models/gemma3n.litertlm",
+                "accelerator": "gpu",
+                "image_arg": "--image_path",
+                "extra_args": ["--max_tokens=256"]
+            }
+        }"#;
+        let cfg: Config = serde_json::from_str(json_litert).unwrap();
+        match cfg.backend {
+            BackendConfig::LitertLm {
+                binary,
+                model_path,
+                accelerator,
+                image_arg,
+                extra_args,
+            } => {
+                assert_eq!(binary, "/usr/local/bin/litert_lm_main");
+                assert_eq!(model_path, "/models/gemma3n.litertlm");
+                assert_eq!(accelerator.as_deref(), Some("gpu"));
+                assert_eq!(image_arg.as_deref(), Some("--image_path"));
+                assert_eq!(extra_args, vec!["--max_tokens=256"]);
+            }
+            _ => panic!("expected litert_lm backend"),
+        }
+
+        // 4. Plugin Backend
         let json_plugin = r#"{
             "backend": {
                 "type": "plugin",

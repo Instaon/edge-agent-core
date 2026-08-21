@@ -63,6 +63,62 @@ pub struct PluginOutput {
     pub error: Option<String>,
 }
 
+/// Constructors for native (in-process) plugins, which build the envelope
+/// directly instead of serializing it across a sandbox boundary.
+impl PluginOutput {
+    pub fn reply(text: impl Into<String>) -> Self {
+        Self {
+            ok: true,
+            result: serde_json::Value::Null,
+            decision: None,
+            reply: Some(text.into()),
+            error: None,
+        }
+    }
+
+    pub fn result(value: serde_json::Value) -> Self {
+        Self {
+            ok: true,
+            result: value,
+            decision: None,
+            reply: None,
+            error: None,
+        }
+    }
+
+    pub fn fail(msg: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            result: serde_json::Value::Null,
+            decision: None,
+            reply: None,
+            error: Some(msg.into()),
+        }
+    }
+
+    /// Strategy: handled deterministically, `reply` is the answer.
+    pub fn rule(reply: impl Into<String>) -> Self {
+        Self {
+            ok: true,
+            result: serde_json::Value::Null,
+            decision: Some("rule".into()),
+            reply: Some(reply.into()),
+            error: None,
+        }
+    }
+
+    /// Strategy: defer to the model path.
+    pub fn model() -> Self {
+        Self {
+            ok: true,
+            result: serde_json::Value::Null,
+            decision: Some("model".into()),
+            reply: None,
+            error: None,
+        }
+    }
+}
+
 /// Payload of a `host_call` from the sandbox: `{"cap": "...", "op": ..., "args": ...}`.
 /// `cap` must appear verbatim in the manifest's `permissions.capabilities`.
 #[derive(Debug, Deserialize)]

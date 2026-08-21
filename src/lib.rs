@@ -14,5 +14,8 @@ pub mod plugin;
 
 pub use config::Config;
 pub use event::Event;
-pub use kernel::{Kernel, TaskOutcome};
+pub use inference::{ImagePart, InferenceBackend, UserInput};
+pub use kernel::{Kernel, KernelBuilder, TaskOutcome};
+pub use plugin::abi::{PluginInput, PluginOutput};
+pub use plugin::native::{NativePlugin, NativeRegistry};
 pub use plugin::runtime::HostBridge;

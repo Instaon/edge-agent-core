@@ -25,7 +25,9 @@ echo '{"kind":"command","payload":"hello"}' | cargo run --bin edge-agent
 
 ### 1.3 接入真实模型
 
-编辑 `edge-agent.json`，把 `backend` 换成任何讲 OpenAI chat-completions 协议的本地服务（llama.cpp server、ollama 等）：
+内置两种真实后端，都支持多模态输入（文字 + 图片）。
+
+**OpenAI 兼容**：编辑 `edge-agent.json`，把 `backend` 换成任何讲 OpenAI chat-completions 协议的本地服务（llama.cpp server、ollama、vllm 等）。图片以标准 `image_url` 内容分块（base64 data URL）发送——用视觉模型（qwen2.5-vl、llava 等）即可收图：
 
 ```json
 {
@@ -38,15 +40,44 @@ echo '{"kind":"command","payload":"hello"}' | cargo run --bin edge-agent
 }
 ```
 
-如果你的推理库只有 C-ABI（比如直接链接 llama.cpp 的 `.so`），不要等框架内置支持——自己实现 `InferenceBackend` trait（见 [inference.rs](../src/inference.rs)），在 `generate()` 里做 FFI 调用，然后把 `edge-agent-core` 当库用，在 `Kernel::new` 时传入你的实现。`edge-agent` 这个二进制只是给内置后端用的最小 runner，接自定义 trait 实现需要写自己的 `main`。
+**LiteRT-LM**（Google AI Edge 端侧运行时，`.litertlm` 模型包）：经 `litert_lm_main` CLI 驱动，`accelerator` 映射它的 `--backend` 标志（cpu/gpu/npu）。图片经临时文件传入，需要配置 `image_arg` 指定你的 litert_lm 构建接收图片的标志；未配置时收到图片会显式报错，不会静默丢图：
 
-第三种方式是把推理整个交给 wasm 插件（无需改 Rust 代码，插件可热更）：
+```json
+{
+  "backend": {
+    "type": "litert_lm",
+    "binary": "/usr/local/bin/litert_lm_main",
+    "model_path": "/models/gemma3n.litertlm",
+    "accelerator": "gpu",
+    "image_arg": "--image_path",
+    "extra_args": []
+  }
+}
+```
+
+**带图片的事件长这样**（`text` 之外可给磁盘路径或内联 base64，两种可混用）：
+
+```json
+{"kind": "command", "payload": {
+  "text": "门口摄像头拍到了什么？",
+  "images": [
+    { "path": "/tmp/doorcam.jpg" },
+    { "mime": "image/png", "b64": "iVBORw0KGgo..." }
+  ]
+}}
+```
+
+图片按次传递，不进有界对话上下文；`path` 读取失败或 `b64` 非法会让任务在推理前就走降级链，错误信息里带下标。
+
+如果你的推理库只有 C-ABI（比如直接链接 llama.cpp 的 `.so`），不要等框架内置支持——自己实现 `InferenceBackend` trait（见 [inference.rs](../src/inference.rs)），在 `generate()` 里做 FFI 调用，然后把 `edge-agent-core` 当库用，经 `Kernel::builder(cfg).backend(Box::new(yours))` 注入（优先级高于配置文件）。`edge-agent` 这个二进制只是给内置后端用的最小 runner，接自定义 trait 实现需要写自己的 `main`。
+
+最后一种方式是把推理整个交给 wasm 插件（无需改 Rust 代码，插件可热更）：
 
 ```json
 { "backend": { "type": "plugin", "name": "my-infer" } }
 ```
 
-内核会以 `kind: "infer"` 调用名为 `my-infer` 的插件，`args` 携带 `{"system": "...", "input": "..."}`；插件把模型的原始回答放进 `reply` 返回。推理插件通常需要在 manifest 声明 `context: true`（拿到对话历史）和网络类 capability（经 `host_call` 访问本地推理服务）。它和普通插件走同一套预算/健康统计——连续失败同样会被自动禁用回滚。
+内核会以 `kind: "infer"` 调用名为 `my-infer` 的插件，`args` 携带 `{"system": "...", "input": "...", "images": [{"mime": ..., "b64": ...}]}`；插件把模型的原始回答放进 `reply` 返回。推理插件通常需要在 manifest 声明 `context: true`（拿到对话历史）和网络类 capability（经 `host_call` 访问本地推理服务）。它和普通插件走同一套预算/健康统计——连续失败同样会被自动禁用回滚。
 
 ### 1.4 注意事项（容易踩的坑）
 
@@ -56,11 +87,67 @@ echo '{"kind":"command","payload":"hello"}' | cargo run --bin edge-agent
 - **一个任务里工具调用失败不会自动重试**，会直接进入降级链（策略 fallback → 安全拒绝）。如果你的工具本身有瞬时性错误（比如串口偶发超时），重试逻辑要写在工具插件内部或者 `HostBridge` 实现里，内核不做这个决定。
 - **`plugin_fuel` 太小会让复杂计算的插件被中途打断**，且不会有清晰的"超时"提示——燃料耗尽在 wasmtime 里表现为一次 trap，`invoke_plugin` 会把它当成插件失败计入健康统计。刚开始调试插件时可以把这个值调大（比如 5 亿），稳定后再收紧。
 
-## 2. 编写一个 Wasm 插件
+## 2. 原生插件：直接用 Rust 注册（业务默认路径）
+
+用本框架开发业务时，工具/策略/钩子首选直接写原生 Rust——Wasm 只是需要**运行时热更**时才用的执行形态（见第 3 章）。原生插件与 Wasm 插件共用同一套 `PluginInput`/`PluginOutput` 契约和内核调度：模型看到的工具列表、策略路由、12 个生命周期挂载点、`device:*` 资源锁，两种形态一视同仁；同名冲突时原生优先。
+
+原生插件在 `Kernel::builder` 上注册（必须在构建期注册，`kernel_start` 等挂载点才能看到它们）。实现 `NativePlugin` trait，或直接给一个闭包（任何 `FnMut(&PluginInput) -> anyhow::Result<PluginOutput> + Send` 都行）：
+
+```rust
+use edge_agent_core::{Config, Kernel, NativePlugin, PluginInput, PluginOutput};
+
+// 有状态的插件用 struct 实现 trait
+struct DoorLock { open_count: u32 }
+impl NativePlugin for DoorLock {
+    fn handle(&mut self, input: &PluginInput) -> anyhow::Result<PluginOutput> {
+        self.open_count += 1;
+        // 这里直接调 GPIO / 串口 / 本地总线——原生代码不需要 host_call
+        Ok(PluginOutput::reply("门已开"))
+    }
+}
+
+let mut kernel = Kernel::builder(Config::default())
+    // 工具：devices 列出占用的资源锁，调用期间独占，忙则拒绝
+    .register_tool("door_lock", &["device:lock0"], DoorLock { open_count: 0 })
+    // 策略：无状态逻辑用闭包最省事
+    .register_strategy("router", |input: &PluginInput| {
+        let text = input.event.as_ref()
+            .and_then(|e| e["payload"].as_str()).unwrap_or("");
+        if text == "ping" {
+            Ok(PluginOutput::rule("pong"))       // 规则直达，不进模型
+        } else {
+            Ok(PluginOutput::model())            // 交给模型
+        }
+    })
+    // 钩子：观察者，不影响主流程
+    .register_hook("audit", &["on_degrade", "post_task"], |input: &PluginInput| {
+        eprintln!("[audit] {:?} {:?}", input.hook, input.args);
+        Ok(PluginOutput::result(serde_json::Value::Null))
+    })
+    .build()?;
+```
+
+`PluginOutput` 提供了全套构造函数：`reply(text)`（工具答复）、`result(value)`（结构化结果）、`rule(reply)` / `model()`（策略决策）、`fail(msg)`（失败上报）。
+
+与 Wasm 形态的差异，都源于"原生代码与内核编译在同一个二进制里，天然同信任级"：
+
+| | 原生注册 | Wasm 插件 |
+| --- | --- | --- |
+| 加载时机 | 编译期（builder 注册） | 运行时（扫描/热更/回滚） |
+| 沙箱/燃料/内存配额 | 无（进程内直调） | wasmtime 沙箱强制 |
+| 验签 | 不需要 | ed25519 强制（除 dev 模式） |
+| 上下文可见性 | 总是可见 | manifest 声明 `context: true` 才可见 |
+| 触达硬件 | 直接调用 | 仅经 `host_call` + capability 裁决 |
+| 失败处理 | 报错进降级链/熔断 | 健康统计 + 自动禁用回滚 |
+| 资源锁 | `register_tool` 的 `devices` 参数 | manifest 的 `device:*` capability |
+
+选型准则：**自己写、随固件一起发版的能力 → 原生注册；需要不停机热更、来源第三方、或需要故障隔离的能力 → Wasm。**
+
+## 3. 编写一个 Wasm 插件（热更形态）
 
 插件是一个普通的 Rust `cdylib`，编译到 `wasm32-unknown-unknown`。完整可运行的例子在 [examples/plugins/strategy-demo](../examples/plugins/strategy-demo)，本节讲清楚每一步在做什么、为什么必须这样写。
 
-### 2.1 最小骨架
+### 3.1 最小骨架
 
 ```toml
 # Cargo.toml
@@ -107,13 +194,13 @@ pub extern "C" fn ea_handle(ptr: i32, len: i32) -> i64 {
 
 `ea_handle` 的返回值是 `(ptr << 32 | len)` 打包成的 `i64`，`0` 表示内部错误。宿主用这个约定从 guest 内存里读回结果，不需要额外导出"取结果"的函数。
 
-### 2.2 输入长什么样
+### 3.2 输入长什么样
 
 内核传入的 JSON（对应 `PluginInput`）:
 
 ```json
 {
-  "kind": "tool",              // "tool" | "strategy" | "hook" | "infer" | "repair"（后两者是内核保留调用，见 2.4 末尾）
+  "kind": "tool",              // "tool" | "strategy" | "hook" | "infer" | "repair"（后两者是内核保留调用，见 3.4 末尾）
   "hook": null,                 // kind=hook 时是挂载点名，如 "pre_task"
   "event": { "kind": "command", "payload": "turn on light", "priority": 0, "source": "" },
   "context": null,              // 只有 manifest 声明 permissions.context=true 才非空
@@ -123,7 +210,7 @@ pub extern "C" fn ea_handle(ptr: i32, len: i32) -> i64 {
 
 `context`（如果有）是一个数组：`[{"role": "user", "content": "..."}, ...]`，只读副本，改了也不会影响内核真实上下文。
 
-### 2.3 输出必须是什么样
+### 3.3 输出必须是什么样
 
 对应 `PluginOutput`，**严格信封，多一个字段都会被整体拒绝**：
 
@@ -149,7 +236,7 @@ pub extern "C" fn ea_handle(ptr: i32, len: i32) -> i64 {
 
 不要在 JSON 里加文档没提到的字段——`deny_unknown_fields` 会让整个输出被当作非法格式丢弃，即使 `ok: true` 也一样。
 
-### 2.4 三类插件怎么写
+### 3.4 三类插件怎么写
 
 **工具插件（tool）**：`ea_handle` 收到 `kind: "tool"`，`args` 是模型规划出的参数，执行具体动作后把结果放进 `result`/`reply`。
 
@@ -200,7 +287,7 @@ pub extern "C" fn ea_handle(ptr: i32, len: i32) -> i64 {
 
 被配置为 infer/repair 的插件会自动从模型可调用的工具列表中剔除，模型永远无法直接调用它们。
 
-### 2.5 调用外部能力（host_call）
+### 3.5 调用外部能力（host_call）
 
 插件不能直接访问文件、网络、硬件，唯一途径是：
 
@@ -222,7 +309,7 @@ fn call_host(req: &serde_json::Value) -> serde_json::Value {
 
 `cap` 的具体行为（`op`/`args` 怎么解释）由业务实现的 `HostBridge` 决定，框架不规定命名规范，但建议约定俗成用 `device:<资源名>` / `net:<host>:<port>` 这类前缀，方便和资源锁的设备命名对齐（资源锁只识别 `device:` 前缀的能力项，见 [kernel.rs](../src/kernel.rs) 的 `run_tool`）。
 
-### 2.6 日志
+### 3.6 日志
 
 ```rust
 #[link(wasm_import_module = "edge")]
@@ -231,7 +318,7 @@ extern "C" { fn host_log(ptr: *const u8, len: usize); }
 
 传入的字符串会打印到内核 stderr，格式 `[plugin:<name>] <msg>`。这是插件唯一的可观测手段，调试格式错误、权限拒绝时优先看这里。
 
-### 2.7 编写清单（manifest.json）
+### 3.7 编写清单（manifest.json）
 
 ```json
 {
@@ -252,7 +339,7 @@ extern "C" { fn host_log(ptr: *const u8, len: usize); }
 - `context: true` 会让插件在每次调用时都收到完整对话历史副本——不需要就别开，减少插件能看到的数据面。
 - `capabilities` 只列这个插件真正要用的能力，声明越少，攻击面越小；分发时签名会覆盖这个列表，事后改不了。
 
-## 3. 编译与本地测试
+## 4. 编译与本地测试
 
 ```bash
 cd my-plugin
@@ -260,7 +347,7 @@ cargo build --release --target wasm32-unknown-unknown
 ls target/wasm32-unknown-unknown/release/*.wasm   # 通常几十到一两百 KB
 ```
 
-## 4. 分发规范：打包、签名、部署
+## 5. 分发规范：打包、签名、部署
 
 插件包在磁盘上必须是这个结构，目录名即身份，加载时会核对目录名与 manifest 内容一致：
 
@@ -272,7 +359,7 @@ plugins/
         └── manifest.json
 ```
 
-### 4.1 生成签名密钥（厂商/开发者只做一次）
+### 5.1 生成签名密钥（厂商/开发者只做一次）
 
 ```bash
 cargo run --bin ea-pack -- keygen ./vendor-key
@@ -285,7 +372,7 @@ cargo run --bin ea-pack -- keygen ./vendor-key
 { "trusted_pubkey": "<vendor-key.pub 的内容>", "dev_allow_unsigned": false }
 ```
 
-### 4.2 组装并签名一个包
+### 5.2 组装并签名一个包
 
 ```bash
 mkdir -p plugins/my-plugin/1.0.0
@@ -296,7 +383,7 @@ cargo run --bin ea-pack -- sign plugins/my-plugin/1.0.0 ./vendor-key.key
 
 签名覆盖 `name + version + kind + hooks + context 权限 + capabilities 列表 + wasm 的 sha256`（详见 [02-core-design.md](02-core-design.md) 第 6.4 节）——签名之后再改任何一项，验签都会失败，不存在"改小权限不用重签"这种漏洞。
 
-### 4.3 部署（三种渠道，验证逻辑完全一致）
+### 5.3 部署（三种渠道，验证逻辑完全一致）
 
 - **随固件预置**：直接把 `plugins/` 目录打进镜像；
 - **局域网/云端下发**：把整个版本目录（`plugin.wasm` + 签好名的 `manifest.json`）传到设备的 `plugins/<name>/<新版本号>/`，无需重启，见下节热更新；
@@ -304,7 +391,7 @@ cargo run --bin ea-pack -- sign plugins/my-plugin/1.0.0 ./vendor-key.key
 
 三种渠道走的是同一份验签代码（[plugin/registry.rs](../src/plugin/registry.rs) 的 `load_version`），不存在"内网渠道可以少验一步"的例外。
 
-### 4.4 热更新
+### 5.4 热更新
 
 不需要特殊指令：把新版本目录放到位后，向内核发一个内核保留事件：
 
@@ -314,7 +401,7 @@ echo '{"kind":"plugin_reload","payload":{"name":"my-plugin"}}' | cargo run --bin
 
 内核会重新扫描该插件名下所有版本，选中**签名有效且未被 `.disabled` 标记的最高 semver**。正在执行的任务持有的是旧版本的模块句柄，会跑完；下一个任务开始时才用新版本。旧版本文件不需要手动删除，只有它是"未被选中"或"被标记 disabled"的状态。
 
-### 4.5 回滚是自动的
+### 5.5 回滚是自动的
 
 新版本连续失败达到 `plugin_max_failures`（默认 3）次后，内核会：
 
@@ -323,7 +410,7 @@ echo '{"kind":"plugin_reload","payload":{"name":"my-plugin"}}' | cargo run --bin
 
 不需要人工介入。如果想手动强制回滚，直接在对应版本目录下创建空文件 `.disabled` 即可，效果相同。想恢复某个被标记的版本，删掉 `.disabled` 文件并触发一次 `plugin_reload`。
 
-## 5. 完整冒烟脚本
+## 6. 完整冒烟脚本
 
 下面这段命令把"打包 → 签名 → 加载 → 篡改检测"跑一遍，可以直接复制运行来验证一套新环境是否配置正确：
 
