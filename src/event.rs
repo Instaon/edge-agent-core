@@ -142,5 +142,3 @@ mod tests {
         assert!(q.pop().is_none());
     }
 }
-
-

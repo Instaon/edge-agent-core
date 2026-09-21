@@ -180,4 +180,3 @@ mod tests {
         assert_eq!(m1.signing_payload(wasm), m2.signing_payload(wasm));
     }
 }
-

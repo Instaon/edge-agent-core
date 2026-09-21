@@ -27,4 +27,4 @@ path = "src/bin/ea_pack.rs"
 
 [workspace]
 members = ["."]
-exclude = ["examples/plugins/strategy-demo"]
+exclude = ["examples/plugins/strategy-demo", "examples/plugins/spider-bot", "examples/plugins/auto-lamp", "examples/plugins/auto-fan", "examples/plugins/le-lamp"]

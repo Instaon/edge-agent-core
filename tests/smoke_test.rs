@@ -6,8 +6,8 @@ use edge_agent_core::{
     kernel::Kernel,
     plugin::runtime::HostBridge,
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Smoke Test 1: Basic end-to-end event execution with mock backend.
 #[test]

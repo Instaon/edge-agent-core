@@ -55,9 +55,11 @@ mod tests {
     fn all_or_nothing_atomicity() {
         let mut locks = ResourceLocks::default();
         // Task 1 holds motor_a
-        assert!(locks
-            .acquire_all(1, &["device:motor_a".to_string()])
-            .is_ok());
+        assert!(
+            locks
+                .acquire_all(1, &["device:motor_a".to_string()])
+                .is_ok()
+        );
 
         // Task 2 tries to acquire motor_b AND motor_a
         let task2_req = vec!["device:motor_b".to_string(), "device:motor_a".to_string()];
@@ -89,7 +91,9 @@ mod tests {
         // res1 is free
         assert!(locks.acquire_all(3, &["res1".to_string()]).is_ok());
         // res2 is still held by task 2
-        assert_eq!(locks.acquire_all(3, &["res2".to_string()]), Err("res2".to_string()));
+        assert_eq!(
+            locks.acquire_all(3, &["res2".to_string()]),
+            Err("res2".to_string())
+        );
     }
 }
-

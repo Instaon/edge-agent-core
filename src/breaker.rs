@@ -117,4 +117,3 @@ mod tests {
         assert!(!b.is_open());
     }
 }
-

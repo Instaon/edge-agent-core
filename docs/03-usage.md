@@ -232,6 +232,7 @@ pub extern "C" fn ea_handle(ptr: i32, len: i32) -> i64 {
 | `result` | 工具/钩子的结构化返回值，被调用方（模型或业务）读取 |
 | `decision` | 仅策略插件用："rule"（规则直达，用 `reply` 作为最终答案）或 "model"（交给模型处理） |
 | `reply` | 直接面向用户的文本答案 |
+| `thought` | 可选。策略插件 `decision: "rule"` 时给宿主意识流的一句短念头；内核不当业务解释。不填则宿主用通用文案，**不要让宿主按插件名猜** |
 | `error` | `ok=false` 时的原因，会出现在内核降级日志里 |
 
 不要在 JSON 里加文档没提到的字段——`deny_unknown_fields` 会让整个输出被当作非法格式丢弃，即使 `ok: true` 也一样。
@@ -240,7 +241,7 @@ pub extern "C" fn ea_handle(ptr: i32, len: i32) -> i64 {
 
 **工具插件（tool）**：`ea_handle` 收到 `kind: "tool"`，`args` 是模型规划出的参数，执行具体动作后把结果放进 `result`/`reply`。
 
-**策略插件（strategy）**：收到 `args.phase`，取值 `"route"`（每个任务开始时）或 `"fallback"`（降级发生时）。想做规则直达，返回 `{"ok": true, "decision": "rule", "reply": "..."}`；想交给模型，返回 `{"ok": true, "decision": "model"}`。见 [examples/plugins/strategy-demo/src/lib.rs](../examples/plugins/strategy-demo/src/lib.rs) 里 `ping` 走规则、其他文本走模型的完整示例。
+**策略插件（strategy）**：收到 `args.phase`，取值 `"route"`（每个任务开始时）或 `"fallback"`（降级发生时）。想做规则直达，返回 `{"ok": true, "decision": "rule", "reply": "...", "thought": "..."}`（`thought` 可选，给宿主意识流）；想交给模型，返回 `{"ok": true, "decision": "model"}`。见 [examples/plugins/strategy-demo/src/lib.rs](../examples/plugins/strategy-demo/src/lib.rs) 里 `ping` 走规则、其他文本走模型的完整示例。
 
 **生命周期插件（hook）**：`manifest.json` 里 `hooks` 数组声明要挂载的点，`ea_handle` 收到 `hook` 字段告知当前是哪个点，`args` 字段携带该点的专属数据。钩子是**观察者而非拦截器**：它的 `result`/`reply` 不会影响主流程，失败也只是记日志——适合做状态上报、审计、指标采集这类旁路逻辑；想改变流程走向请写策略插件。
 
@@ -258,7 +259,7 @@ pub extern "C" fn ea_handle(ptr: i32, len: i32) -> i64 {
 | 挂载点 | 触发时机 | `args` 携带 |
 | --- | --- | --- |
 | `pre_task` | 事件刚出队、正式处理前 | `{}` |
-| `post_route` | 策略路由决策产生后 | `{"decision": "rule"\|"model"\|"none"}` |
+| `post_route` | 策略路由决策产生后 | `{"decision": "rule"\|"model"\|"none", "plugin": 短路插件名或 null, "chain": [{"plugin", "decision"}], "thought": 可选短念头或 null}` |
 | `pre_infer` | 每次即将调用推理后端前（重试会多次触发） | `{"attempt": n}` |
 | `post_infer` | 拿到模型原始输出、格式校验之前 | `{"attempt": n, "raw": "原始输出"}` |
 | `on_plan` | 合法命令解析成功、执行之前（审计点） | `{"plan": {"reply", "tool", "args"}}` |

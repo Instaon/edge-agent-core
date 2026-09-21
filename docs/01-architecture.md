@@ -67,7 +67,7 @@ event
 ┌─────────────────────────────────────────────────────────┐
 │ 1. 策略路由（有 strategy 插件才走这一步）                    │
 │    strategy.route(event) -> decision: "rule" | "model"     │
-│    [post_route 钩子] 携带最终 decision（rule/model/none）    │
+│    [post_route 钩子] 携带 decision + 胜出插件 + 整条策略链    │
 │                                                              │
 │    decision=rule  ──▶ 规则直达，不经过模型，直接产出 reply    │
 │    decision=model 或无策略插件 ──▶ 进入第 2 步               │

@@ -135,7 +135,11 @@ mod tests {
         let cfg: Config = serde_json::from_str(json_openai).unwrap();
         assert_eq!(cfg.context_max_bytes, 1024);
         match cfg.backend {
-            BackendConfig::Openai { url, model, api_key } => {
+            BackendConfig::Openai {
+                url,
+                model,
+                api_key,
+            } => {
                 assert_eq!(url, "http://127.0.0.1:8000/v1");
                 assert_eq!(model, "qwen2.5-coder");
                 assert_eq!(api_key.as_deref(), Some("sk-123"));
@@ -214,4 +218,3 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 }
-

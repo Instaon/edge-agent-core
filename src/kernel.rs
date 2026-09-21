@@ -45,6 +45,16 @@ impl TaskOutcome {
     }
 }
 
+/// Strategy-chain outcome plus who said what. Fed to `post_route` so the
+/// host can log "which plugin won" without guessing from an empty reply.
+struct StrategyRoute {
+    output: Option<PluginOutput>,
+    /// Plugin that returned `decision: "rule"` and short-circuited the chain.
+    winner: Option<String>,
+    /// Every plugin that ran, in order: `(name, decision|"fail"|"error")`.
+    chain: Vec<(String, String)>,
+}
+
 /// The only two shapes the model may answer with. Anything else is rejected
 /// and retried (输出格式强制纠偏 — 内核原生 JSON check).
 #[derive(Debug, Deserialize)]
@@ -223,7 +233,11 @@ impl Kernel {
             pending_rollbacks: Vec::new(),
         };
         let loaded = kernel.registry.names();
-        kernel.run_hooks("kernel_start", None, serde_json::json!({ "plugins": loaded }));
+        kernel.run_hooks(
+            "kernel_start",
+            None,
+            serde_json::json!({ "plugins": loaded }),
+        );
         kernel.drain_rollback_hooks();
         Ok(kernel)
     }
@@ -250,7 +264,10 @@ impl Kernel {
 
         // Kernel-reserved event: silent hot update, applied between tasks.
         if event.kind == "plugin_reload" {
-            let name = event.payload["name"].as_str().unwrap_or_default().to_string();
+            let name = event.payload["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
             let opts = ScanOptions {
                 plugins_dir: &self.plugins_dir,
                 pubkey: self.pubkey.as_ref(),
@@ -291,19 +308,41 @@ impl Kernel {
 
     fn execute(&mut self, task: u64, event: &Event) -> TaskOutcome {
         // 1) Strategy first: deterministic rules may finish the task with no model.
-        let strategy_out = self.run_strategy(event, "route");
-        let decision = match &strategy_out {
+        let routed = self.run_strategy(event, "route");
+        let decision = match &routed.output {
             Some(out) if out.ok => out.decision.clone().unwrap_or_else(|| "model".into()),
             Some(_) => "model".into(), // strategy failed: model path is the default
             None => "none".into(),     // no strategy plugin loaded
         };
+        let chain: Vec<serde_json::Value> = routed
+            .chain
+            .iter()
+            .map(|(name, d)| serde_json::json!({ "plugin": name, "decision": d }))
+            .collect();
+        // Opaque to the kernel: host mindstream may use it as Decide copy.
+        let thought = if decision == "rule" {
+            routed.output.as_ref().and_then(|o| {
+                o.thought
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            })
+        } else {
+            None
+        };
         self.run_hooks(
             "post_route",
             Some(event),
-            serde_json::json!({ "decision": &decision }),
+            serde_json::json!({
+                "decision": &decision,
+                "plugin": routed.winner,
+                "chain": chain,
+                "thought": thought,
+            }),
         );
         if decision == "rule" {
-            if let Some(out) = strategy_out {
+            if let Some(out) = routed.output {
                 self.breaker.record_success();
                 return TaskOutcome::new(
                     "ok",
@@ -484,7 +523,7 @@ impl Kernel {
             Some(event),
             serde_json::json!({ "reason": reason }),
         );
-        if let Some(out) = self.run_strategy(event, "fallback") {
+        if let Some(out) = self.run_strategy(event, "fallback").output {
             if out.ok && out.decision.as_deref() == Some("rule") {
                 return TaskOutcome::new(
                     "ok",
@@ -574,20 +613,63 @@ impl Kernel {
         parse_model_command(&fixed).ok()
     }
 
-    fn run_strategy(&mut self, event: &Event, phase: &str) -> Option<PluginOutput> {
-        // Native strategy takes precedence over a wasm one.
-        let name = self
-            .native
-            .strategy_name()
-            .or_else(|| self.registry.strategy().map(|p| p.manifest.name.clone()))?;
-        let input = PluginInput {
-            kind: "strategy".into(),
-            hook: None,
-            event: Some(serde_json::to_value(event).unwrap_or_default()),
-            context: None,
-            args: serde_json::json!({ "phase": phase }),
-        };
-        self.invoke_plugin(&name, input).ok()
+    /// Wasm interceptors first (hot-updatable), then native catch-alls.
+    /// `invoke_plugin` still prefers native on a name collision.
+    fn strategy_chain_names(&self) -> Vec<String> {
+        let mut names = self.registry.strategy_names();
+        for n in self.native.strategy_names() {
+            if !names.contains(&n) {
+                names.push(n);
+            }
+        }
+        names
+    }
+
+    fn run_strategy(&mut self, event: &Event, phase: &str) -> StrategyRoute {
+        let names = self.strategy_chain_names();
+        if names.is_empty() {
+            return StrategyRoute {
+                output: None,
+                winner: None,
+                chain: Vec::new(),
+            };
+        }
+        // First `decision: "rule"` wins. `"model"` (or a failed plugin) continues
+        // down the chain so a miss / network error can fall through to the next
+        // strategy and eventually the model path.
+        let mut last_model = None;
+        let mut chain = Vec::new();
+        for name in names {
+            let input = PluginInput {
+                kind: "strategy".into(),
+                hook: None,
+                event: Some(serde_json::to_value(event).unwrap_or_default()),
+                context: None,
+                args: serde_json::json!({ "phase": phase }),
+            };
+            match self.invoke_plugin(&name, input) {
+                Ok(out) if out.ok && out.decision.as_deref() == Some("rule") => {
+                    chain.push((name.clone(), "rule".into()));
+                    return StrategyRoute {
+                        output: Some(out),
+                        winner: Some(name),
+                        chain,
+                    };
+                }
+                Ok(out) if out.ok => {
+                    let d = out.decision.clone().unwrap_or_else(|| "model".into());
+                    chain.push((name, d));
+                    last_model = Some(out);
+                }
+                Ok(_) => chain.push((name, "fail".into())),
+                Err(_) => chain.push((name, "error".into())),
+            }
+        }
+        StrategyRoute {
+            output: last_model,
+            winner: None,
+            chain,
+        }
     }
 
     /// Lifecycle hooks are observers, not interceptors: their output never
@@ -790,7 +872,9 @@ fn mime_from_path(path: &str) -> String {
 
 /// Tolerant extraction (models love markdown fences), strict validation.
 fn parse_model_command(raw: &str) -> anyhow::Result<ModelCommand> {
-    let start = raw.find('{').ok_or_else(|| anyhow::anyhow!("no JSON object in output"))?;
+    let start = raw
+        .find('{')
+        .ok_or_else(|| anyhow::anyhow!("no JSON object in output"))?;
     let end = raw
         .rfind('}')
         .ok_or_else(|| anyhow::anyhow!("no JSON object in output"))?;
@@ -889,7 +973,8 @@ mod tests {
         assert!(user_input_from_event(&ev).is_err());
 
         // Path-based image with mime inferred from extension
-        let img_path = std::env::temp_dir().join(format!("ea-kernel-test-{}.png", std::process::id()));
+        let img_path =
+            std::env::temp_dir().join(format!("ea-kernel-test-{}.png", std::process::id()));
         std::fs::write(&img_path, b"disk-png").unwrap();
         let ev = Event {
             kind: "command".into(),
@@ -926,6 +1011,54 @@ mod tests {
         assert_eq!(outcome.status, "ok");
         assert_eq!(outcome.via, "rule");
         assert_eq!(outcome.reply, "handled by rule");
+    }
+
+    #[test]
+    fn strategy_chain_model_falls_through_to_the_next_strategy() {
+        let cfg = Config {
+            dev_allow_unsigned: true,
+            backend: BackendConfig::Mock,
+            ..Default::default()
+        };
+        let mut kernel = Kernel::builder(cfg)
+            .register_strategy("a-intercept", |input: &PluginInput| {
+                let text = input
+                    .event
+                    .as_ref()
+                    .and_then(|e| e["payload"].as_str())
+                    .unwrap_or("");
+                if text.contains("spider") {
+                    Ok(PluginOutput::rule("intercepted"))
+                } else {
+                    Ok(PluginOutput::model())
+                }
+            })
+            .register_strategy("z-catch", |_input: &PluginInput| {
+                Ok(PluginOutput::rule("caught by later strategy"))
+            })
+            .build()
+            .unwrap();
+
+        let hit = kernel.handle_event(Event {
+            kind: "command".into(),
+            payload: serde_json::json!("ask spider to wave"),
+            priority: 1,
+            source: "test".into(),
+        });
+        assert_eq!(hit.via, "rule");
+        assert_eq!(hit.reply, "intercepted");
+
+        let miss = kernel.handle_event(Event {
+            kind: "command".into(),
+            payload: serde_json::json!("what's the weather"),
+            priority: 1,
+            source: "test".into(),
+        });
+        assert_eq!(miss.via, "rule");
+        assert_eq!(
+            miss.reply, "caught by later strategy",
+            "a miss must continue the chain instead of jumping straight to the model"
+        );
     }
 
     #[test]
@@ -1022,4 +1155,3 @@ mod tests {
         assert_eq!(outcome.reply, "[mock] turn off the light");
     }
 }
-

@@ -114,16 +114,21 @@ impl NativeRegistry {
         names
     }
 
-    /// The single active native strategy (deterministic pick if several exist).
-    pub fn strategy_name(&self) -> Option<String> {
-        let mut names: Vec<&String> = self
+    /// Native strategies in deterministic (lexicographic) order.
+    pub fn strategy_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
             .entries
             .iter()
             .filter(|(_, e)| e.kind == PluginKind::Strategy)
-            .map(|(n, _)| n)
+            .map(|(n, _)| n.clone())
             .collect();
         names.sort();
-        names.first().map(|n| n.to_string())
+        names
+    }
+
+    /// The single active native strategy (deterministic pick if several exist).
+    pub fn strategy_name(&self) -> Option<String> {
+        self.strategy_names().into_iter().next()
     }
 
     pub fn hooks_for(&self, point: &str) -> Vec<String> {
@@ -137,11 +142,7 @@ impl NativeRegistry {
         names
     }
 
-    pub fn invoke(
-        &mut self,
-        name: &str,
-        input: &PluginInput,
-    ) -> anyhow::Result<PluginOutput> {
+    pub fn invoke(&mut self, name: &str, input: &PluginInput) -> anyhow::Result<PluginOutput> {
         let entry = self
             .entries
             .get_mut(name)

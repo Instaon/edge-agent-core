@@ -90,6 +90,18 @@ impl Registry {
         self.plugins.get(name)
     }
 
+    /// Wasm strategy plugin names in deterministic (lexicographic) order.
+    pub fn strategy_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .plugins
+            .values()
+            .filter(|p| p.manifest.kind == PluginKind::Strategy)
+            .map(|p| p.manifest.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
     /// The single active strategy plugin (deterministic pick if several exist).
     pub fn strategy(&self) -> Option<&LoadedPlugin> {
         let mut found: Vec<&LoadedPlugin> = self
@@ -106,8 +118,7 @@ impl Registry {
             .plugins
             .values()
             .filter(|p| {
-                p.manifest.kind == PluginKind::Hook
-                    && p.manifest.hooks.iter().any(|h| h == point)
+                p.manifest.kind == PluginKind::Hook && p.manifest.hooks.iter().any(|h| h == point)
             })
             .collect();
         found.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name));
@@ -198,10 +209,7 @@ fn load_best_version(
     for (version, dir) in versions {
         match load_version(rt, &dir, &dir_name, &version, opts) {
             Ok(p) => return Ok(Some(p)),
-            Err(e) => eprintln!(
-                "[registry] {}/{} skipped: {e:#}",
-                dir_name, version
-            ),
+            Err(e) => eprintln!("[registry] {}/{} skipped: {e:#}", dir_name, version),
         }
     }
     Ok(None)
@@ -239,7 +247,9 @@ fn load_version(
             "[registry] WARNING: loading UNSIGNED plugin '{}' (dev mode)",
             manifest.name
         ),
-        (None, false) => anyhow::bail!("no trusted_pubkey configured and dev_allow_unsigned is off"),
+        (None, false) => {
+            anyhow::bail!("no trusted_pubkey configured and dev_allow_unsigned is off")
+        }
     }
 
     let module = rt.compile(&wasm).context("wasm compilation failed")?;
@@ -260,7 +270,13 @@ mod tests {
     #[test]
     fn scan_loads_highest_version_and_skips_disabled() {
         let rt = PluginRuntime::new().unwrap();
-        let temp_dir = std::env::temp_dir().join(format!("test_reg_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "test_reg_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let p_dir = temp_dir.join("my-tool");
         let v1_dir = p_dir.join("1.0.0");
         let v2_dir = p_dir.join("2.0.0");
@@ -315,10 +331,11 @@ mod tests {
         assert!(reg.report_result(&rt, &opts, "my-tool", false, 2)); // 2nd failure trips rollback
 
         // Now v2 is marked .disabled, active version should be 1.0.0
-        let rolled = reg.get("my-tool").expect("my-tool should have rolled back to 1.0.0");
+        let rolled = reg
+            .get("my-tool")
+            .expect("my-tool should have rolled back to 1.0.0");
         assert_eq!(rolled.manifest.version, "1.0.0");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
-

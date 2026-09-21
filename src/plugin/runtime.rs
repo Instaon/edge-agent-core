@@ -4,14 +4,16 @@
 //! capability-gated `host_call`. Everything else is unreachable by construction.
 
 use super::abi::{
-    self, HostCallRequest, PluginInput, PluginOutput, GUEST_ALLOC, GUEST_HANDLE, HOST_CALL,
-    HOST_LOG, HOST_MODULE,
+    self, GUEST_ALLOC, GUEST_HANDLE, HOST_CALL, HOST_LOG, HOST_MODULE, HostCallRequest,
+    PluginInput, PluginOutput,
 };
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
 use std::collections::HashSet;
 use std::sync::Arc;
-use wasmtime::{Caller, Config as WtConfig, Engine, Linker, Module, Store, StoreLimits,
-    StoreLimitsBuilder, TypedFunc};
+use wasmtime::{
+    Caller, Config as WtConfig, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder,
+    TypedFunc,
+};
 
 /// Business-side capability provider. The kernel routes every approved
 /// `host_call` here; registering providers is how tool plugins reach real
@@ -116,8 +118,7 @@ impl PluginRuntime {
         store.set_fuel(fuel)?;
 
         let instance = self.linker.instantiate(&mut store, module)?;
-        let alloc: TypedFunc<i32, i32> =
-            instance.get_typed_func(&mut store, GUEST_ALLOC)?;
+        let alloc: TypedFunc<i32, i32> = instance.get_typed_func(&mut store, GUEST_ALLOC)?;
         let handle: TypedFunc<(i32, i32), i64> =
             instance.get_typed_func(&mut store, GUEST_HANDLE)?;
         let memory = instance

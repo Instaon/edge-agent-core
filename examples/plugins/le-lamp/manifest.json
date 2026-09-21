@@ -1,0 +1,11 @@
+{
+  "name": "le-lamp",
+  "version": "1.0.0",
+  "kind": "strategy",
+  "hooks": [],
+  "permissions": {
+    "context": false,
+    "capabilities": ["net:le-lamp"]
+  },
+  "signature": null
+}

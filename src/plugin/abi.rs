@@ -59,6 +59,13 @@ pub struct PluginOutput {
     /// Direct user-facing reply, when the plugin produced one.
     #[serde(default)]
     pub reply: Option<String>,
+    /// Optional first-person thought for the host mindstream. The kernel
+    /// does not interpret it; a missing/empty value means the host should
+    /// use its generic copy. Strategy plugins that short-circuit with
+    /// `decision: "rule"` may set this so the host never has to guess
+    /// from the plugin name.
+    #[serde(default)]
+    pub thought: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -72,6 +79,7 @@ impl PluginOutput {
             result: serde_json::Value::Null,
             decision: None,
             reply: Some(text.into()),
+            thought: None,
             error: None,
         }
     }
@@ -82,6 +90,7 @@ impl PluginOutput {
             result: value,
             decision: None,
             reply: None,
+            thought: None,
             error: None,
         }
     }
@@ -92,6 +101,7 @@ impl PluginOutput {
             result: serde_json::Value::Null,
             decision: None,
             reply: None,
+            thought: None,
             error: Some(msg.into()),
         }
     }
@@ -103,6 +113,7 @@ impl PluginOutput {
             result: serde_json::Value::Null,
             decision: Some("rule".into()),
             reply: Some(reply.into()),
+            thought: None,
             error: None,
         }
     }
@@ -114,6 +125,7 @@ impl PluginOutput {
             result: serde_json::Value::Null,
             decision: Some("model".into()),
             reply: None,
+            thought: None,
             error: None,
         }
     }
@@ -201,6 +213,16 @@ mod tests {
         assert!(out.ok);
         assert_eq!(out.reply.as_deref(), Some("Room is warm"));
         assert_eq!(out.result["temperature"], 25.5);
+        assert!(out.thought.is_none());
+
+        let json_thought = r#"{
+            "ok": true,
+            "decision": "rule",
+            "reply": "",
+            "thought": "让台灯去办。"
+        }"#;
+        let out: PluginOutput = serde_json::from_str(json_thought).unwrap();
+        assert_eq!(out.thought.as_deref(), Some("让台灯去办。"));
 
         // Unknown field must be rejected
         let json_invalid = r#"{
@@ -224,4 +246,3 @@ mod tests {
         assert_eq!(req.args["frequency"], 440);
     }
 }
-

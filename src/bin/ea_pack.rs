@@ -15,7 +15,9 @@ fn main() -> anyhow::Result<()> {
         [cmd, prefix] if cmd == "keygen" => keygen(prefix),
         [cmd, dir, key] if cmd == "sign" => sign(Path::new(dir), Path::new(key)),
         _ => {
-            eprintln!("usage:\n  ea-pack keygen <out-prefix>\n  ea-pack sign <version-dir> <keyfile>");
+            eprintln!(
+                "usage:\n  ea-pack keygen <out-prefix>\n  ea-pack sign <version-dir> <keyfile>"
+            );
             std::process::exit(2);
         }
     }

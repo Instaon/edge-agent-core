@@ -1,6 +1,6 @@
 //! CLI binary smoke tests for edge-agent and ea-pack.
 
-use edge_agent_core::plugin::manifest::{parse_pubkey, Manifest};
+use edge_agent_core::plugin::manifest::{Manifest, parse_pubkey};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -97,14 +97,17 @@ fn smoke_edge_agent_stdin_stdout_pipeline() {
         .spawn()
         .expect("failed to spawn edge-agent");
 
-    let event_json = r#"{"kind":"command","payload":"turn on the lamp","priority":1,"source":"cli"}"#;
+    let event_json =
+        r#"{"kind":"command","payload":"turn on the lamp","priority":1,"source":"cli"}"#;
 
     {
         let stdin = child.stdin.as_mut().expect("failed to open stdin");
         writeln!(stdin, "{}", event_json).expect("failed to write to stdin");
     } // stdin is closed here
 
-    let output = child.wait_with_output().expect("failed to wait on edge-agent");
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait on edge-agent");
     assert!(output.status.success());
 
     let stdout_str = String::from_utf8_lossy(&output.stdout);
