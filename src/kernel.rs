@@ -366,7 +366,11 @@ impl Kernel {
             Ok(u) => u,
             Err(e) => return self.fallback(event, &format!("bad input payload: {e:#}")),
         };
-        if let Some(extra) = routed.output.as_ref().and_then(|o| o.model_context.as_deref()) {
+        if let Some(extra) = routed
+            .output
+            .as_ref()
+            .and_then(|o| o.model_context.as_deref())
+        {
             if !extra.trim().is_empty() {
                 user_input.text.push_str("\n\n# 本次任务指令\n");
                 user_input.text.push_str(extra.trim());
@@ -664,8 +668,26 @@ impl Kernel {
                 args: serde_json::json!({ "phase": phase }),
             };
             match self.invoke_plugin(&name, input) {
-                Ok(out) if out.ok && out.decision.as_deref() == Some("rule") => {
+                Ok(mut out) if out.ok && out.decision.as_deref() == Some("rule") => {
                     chain.push((name.clone(), "rule".into()));
+                    // An earlier strategy may have acted and deliberately
+                    // continued so a later strategy can handle this event.
+                    // Keep both observations without changing the winner's fields.
+                    if let Some(previous) = last_model.as_ref().and_then(|o| o.observation.as_ref())
+                    {
+                        if let Some(current) = out.observation.as_mut() {
+                            if let Some(object) = current.as_object_mut() {
+                                if !object.contains_key("mindstream_know") {
+                                    if let Some(know) = previous.get("mindstream_know") {
+                                        object.insert("mindstream_know".into(), know.clone());
+                                    }
+                                }
+                                object.insert("prior_observation".into(), previous.clone());
+                            }
+                        } else {
+                            out.observation = Some(previous.clone());
+                        }
+                    }
                     return StrategyRoute {
                         output: Some(out),
                         winner: Some(name),
@@ -1083,6 +1105,40 @@ mod tests {
             miss.reply, "caught by later strategy",
             "a miss must continue the chain instead of jumping straight to the model"
         );
+    }
+
+    #[test]
+    fn later_rule_keeps_earlier_strategy_observation() {
+        let mut kernel = Kernel::builder(Config {
+            dev_allow_unsigned: true,
+            backend: BackendConfig::Mock,
+            ..Default::default()
+        })
+        .register_strategy("a-mood-light", |_input: &PluginInput| {
+            let mut out = PluginOutput::model();
+            out.observation = Some(serde_json::json!({"light_effect":"静态彩光"}));
+            Ok(out)
+        })
+        .register_strategy("b-greeting", |_input: &PluginInput| {
+            let mut out = PluginOutput::rule("");
+            out.observation = Some(serde_json::json!({"reason":"greeted"}));
+            Ok(out)
+        })
+        .build()
+        .unwrap();
+        let route = kernel.run_strategy(
+            &Event {
+                kind: "signal".into(),
+                payload: serde_json::json!({"kind":"occurrence"}),
+                priority: 1,
+                source: "test".into(),
+            },
+            "route",
+        );
+        assert_eq!(route.winner.as_deref(), Some("b-greeting"));
+        let observation = route.output.unwrap().observation.unwrap();
+        assert_eq!(observation["reason"], "greeted");
+        assert_eq!(observation["prior_observation"]["light_effect"], "静态彩光");
     }
 
     #[test]
