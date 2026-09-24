@@ -66,6 +66,14 @@ pub struct PluginOutput {
     /// from the plugin name.
     #[serde(default)]
     pub thought: Option<String>,
+    /// Structured observation for the host's trace and mindstream. Never
+    /// interpreted as a user-facing reply by the kernel.
+    #[serde(default)]
+    pub observation: Option<serde_json::Value>,
+    /// Optional task instruction for the existing model path. A strategy can
+    /// supply this without changing the shared system prompt.
+    #[serde(default)]
+    pub model_context: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -80,6 +88,8 @@ impl PluginOutput {
             decision: None,
             reply: Some(text.into()),
             thought: None,
+            observation: None,
+            model_context: None,
             error: None,
         }
     }
@@ -91,6 +101,8 @@ impl PluginOutput {
             decision: None,
             reply: None,
             thought: None,
+            observation: None,
+            model_context: None,
             error: None,
         }
     }
@@ -102,6 +114,8 @@ impl PluginOutput {
             decision: None,
             reply: None,
             thought: None,
+            observation: None,
+            model_context: None,
             error: Some(msg.into()),
         }
     }
@@ -114,6 +128,8 @@ impl PluginOutput {
             decision: Some("rule".into()),
             reply: Some(reply.into()),
             thought: None,
+            observation: None,
+            model_context: None,
             error: None,
         }
     }
@@ -126,6 +142,8 @@ impl PluginOutput {
             decision: Some("model".into()),
             reply: None,
             thought: None,
+            observation: None,
+            model_context: None,
             error: None,
         }
     }

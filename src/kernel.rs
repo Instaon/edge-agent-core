@@ -339,6 +339,7 @@ impl Kernel {
                 "plugin": routed.winner,
                 "chain": chain,
                 "thought": thought,
+                "observation": routed.output.as_ref().and_then(|o| o.observation.as_ref()),
             }),
         );
         if decision == "rule" {
@@ -361,10 +362,16 @@ impl Kernel {
 
         // 3) Model path with format enforcement. The payload may be plain
         // text or a multimodal object ({"text": ..., "images": [...]}).
-        let user_input = match user_input_from_event(event) {
+        let mut user_input = match user_input_from_event(event) {
             Ok(u) => u,
             Err(e) => return self.fallback(event, &format!("bad input payload: {e:#}")),
         };
+        if let Some(extra) = routed.output.as_ref().and_then(|o| o.model_context.as_deref()) {
+            if !extra.trim().is_empty() {
+                user_input.text.push_str("\n\n# 本次任务指令\n");
+                user_input.text.push_str(extra.trim());
+            }
+        }
         let system = self.system_prompt();
         let mut last_err = String::new();
         for attempt in 0..=self.cfg.max_format_retries {
@@ -637,13 +644,22 @@ impl Kernel {
         // First `decision: "rule"` wins. `"model"` (or a failed plugin) continues
         // down the chain so a miss / network error can fall through to the next
         // strategy and eventually the model path.
-        let mut last_model = None;
+        let mut last_model: Option<PluginOutput> = None;
         let mut chain = Vec::new();
         for name in names {
+            // Image bytes stay in the trusted host. Strategies get metadata
+            // and request image analysis through a capability instead of
+            // copying multi-megabyte base64 payloads into Wasm memory.
+            let mut plugin_event = serde_json::to_value(event).unwrap_or_default();
+            if let Some(payload) = plugin_event.get_mut("payload") {
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.remove("images");
+                }
+            }
             let input = PluginInput {
                 kind: "strategy".into(),
                 hook: None,
-                event: Some(serde_json::to_value(event).unwrap_or_default()),
+                event: Some(plugin_event),
                 context: None,
                 args: serde_json::json!({ "phase": phase }),
             };
@@ -656,9 +672,17 @@ impl Kernel {
                         chain,
                     };
                 }
-                Ok(out) if out.ok => {
+                Ok(mut out) if out.ok => {
                     let d = out.decision.clone().unwrap_or_else(|| "model".into());
                     chain.push((name, d));
+                    if let Some(previous) = last_model.as_ref() {
+                        if out.model_context.is_none() {
+                            out.model_context = previous.model_context.clone();
+                        }
+                        if out.observation.is_none() {
+                            out.observation = previous.observation.clone();
+                        }
+                    }
                     last_model = Some(out);
                 }
                 Ok(_) => chain.push((name, "fail".into())),
@@ -1059,6 +1083,55 @@ mod tests {
             miss.reply, "caught by later strategy",
             "a miss must continue the chain instead of jumping straight to the model"
         );
+    }
+
+    #[test]
+    fn strategy_context_reaches_model_while_image_bytes_stay_out_of_strategy() {
+        struct AssertingBackend;
+        impl crate::inference::InferenceBackend for AssertingBackend {
+            fn generate(
+                &mut self,
+                _system: &str,
+                _context: &[crate::context::ContextEntry],
+                input: &UserInput,
+            ) -> anyhow::Result<String> {
+                assert!(input.text.contains("用户问题"));
+                assert!(input.text.contains("只描述可见线索"));
+                assert_eq!(input.images.len(), 1);
+                Ok(r#"{"reply":"看到了。"}"#.into())
+            }
+        }
+        let cfg = Config {
+            dev_allow_unsigned: true,
+            backend: BackendConfig::Mock,
+            ..Default::default()
+        };
+        let mut kernel = Kernel::builder(cfg)
+            .backend(Box::new(AssertingBackend))
+            .register_strategy("a-vision", |input: &PluginInput| {
+                let event = input.event.as_ref().unwrap();
+                assert!(event["payload"].get("images").is_none());
+                assert_eq!(event["payload"]["image_count"], 1);
+                let mut out = PluginOutput::model();
+                out.model_context = Some("只描述可见线索".into());
+                out.observation = Some(serde_json::json!({"apparent_emotion":"uncertain"}));
+                Ok(out)
+            })
+            .register_strategy("z-pass", |_input: &PluginInput| Ok(PluginOutput::model()))
+            .build()
+            .unwrap();
+        let outcome = kernel.handle_event(Event {
+            kind: "command".into(),
+            payload: serde_json::json!({
+                "text":"用户问题",
+                "image_count":1,
+                "images":[{"mime":"image/png","b64":"cG5n"}]
+            }),
+            priority: 1,
+            source: "test".into(),
+        });
+        assert_eq!(outcome.status, "ok");
+        assert_eq!(outcome.reply, "看到了。");
     }
 
     #[test]
