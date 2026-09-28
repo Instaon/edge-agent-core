@@ -1,5 +1,6 @@
 {
-  "context_max_bytes": 65536,
+  "context_max_bytes": 8192,
+  "context_compact_threshold_percent": 75,
   "max_format_retries": 2,
   "breaker_max_failures": 3,
   "breaker_max_repeats": 3,

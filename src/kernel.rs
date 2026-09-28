@@ -8,7 +8,7 @@
 
 use crate::breaker::Breaker;
 use crate::config::{BackendConfig, Config};
-use crate::context::Context;
+use crate::context::{Context, ContextCompaction};
 use crate::event::{Event, EventQueue};
 use crate::inference::{
     ImagePart, InferenceBackend, LitertLmBackend, MockBackend, OpenAiBackend, UserInput,
@@ -173,6 +173,14 @@ impl Kernel {
         backend_override: Option<Box<dyn InferenceBackend>>,
         native: NativeRegistry,
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            cfg.context_max_bytes > 0,
+            "context_max_bytes must be positive"
+        );
+        anyhow::ensure!(
+            (1..=99).contains(&cfg.context_compact_threshold_percent),
+            "context_compact_threshold_percent must be between 1 and 99"
+        );
         let infer = match backend_override {
             Some(backend) => InferencePath::Native(backend),
             None => match &cfg.backend {
@@ -217,7 +225,7 @@ impl Kernel {
             },
         );
         let mut kernel = Self {
-            ctx: Context::new(cfg.context_max_bytes),
+            ctx: Context::new(cfg.context_max_bytes, cfg.context_compact_threshold_percent),
             breaker: Breaker::new(cfg.breaker_max_failures, cfg.breaker_max_repeats),
             queue: EventQueue::default(),
             locks: ResourceLocks::default(),
@@ -256,6 +264,26 @@ impl Kernel {
             outcomes.push(self.handle_event(ev));
         }
         outcomes
+    }
+
+    pub fn context_needs_compaction(&self) -> bool {
+        self.ctx.needs_compaction()
+    }
+
+    pub fn context_compaction_candidate(&self) -> Option<ContextCompaction> {
+        self.ctx.compaction_candidate()
+    }
+
+    pub fn apply_context_summary(&mut self, candidate: &ContextCompaction, summary: &str) -> bool {
+        self.ctx.apply_summary(candidate, summary)
+    }
+
+    /// Call only from the host's idle loop. On failure the original context is unchanged.
+    pub fn compact_context(
+        &mut self,
+        summarize: impl FnOnce(&[crate::context::ContextEntry], usize) -> anyhow::Result<String>,
+    ) -> anyhow::Result<bool> {
+        self.ctx.compact_with(summarize)
     }
 
     pub fn handle_event(&mut self, event: Event) -> TaskOutcome {

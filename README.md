@@ -23,7 +23,7 @@
 src/
 ├── kernel.rs            主循环与降级链（核心，所有路径在此汇合）
 ├── event.rs             统一事件入口：优先级队列
-├── context.rs           对话上下文：硬字节预算，超限丢最旧
+├── context.rs           对话上下文：8KB 硬预算，闲时摘要早期条目
 ├── lock.rs              资源锁：同一设备任一时刻只被一个任务控制
 ├── breaker.rs           熔断器：连续失败 / 重复动作计数
 ├── inference.rs         多模态推理后端 trait + Mock / OpenAI 兼容 / LiteRT-LM 实现
@@ -143,4 +143,3 @@ fn main() -> anyhow::Result<()> {
 - [架构与运行流程](docs/01-architecture.md) — 分层结构、主循环每一步的完整路径
 - [核心模块设计与理念](docs/02-core-design.md) — 每个模块为什么这样设计、可替换边界、安全模型落地
 - [使用手册](docs/03-usage.md) — 快速上手、多模态接入、原生插件注册、Wasm 插件写法、12 个生命周期挂载点、分发规范
-

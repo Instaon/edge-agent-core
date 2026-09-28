@@ -8,6 +8,8 @@ use std::path::Path;
 pub struct Config {
     /// Max bytes of conversation context kept in memory (hard cap, oldest dropped).
     pub context_max_bytes: usize,
+    /// Idle compaction starts at this percentage of the hard cap.
+    pub context_compact_threshold_percent: u8,
     /// Max model-format retries before the circuit breaker trips for this task.
     pub max_format_retries: u32,
     /// Consecutive task failures before the kernel enters fallback-only mode.
@@ -72,7 +74,8 @@ pub enum BackendConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            context_max_bytes: 64 * 1024,
+            context_max_bytes: 8 * 1024,
+            context_compact_threshold_percent: 75,
             max_format_retries: 2,
             breaker_max_failures: 3,
             breaker_max_repeats: 3,
@@ -102,7 +105,8 @@ mod tests {
     #[test]
     fn default_config_values() {
         let cfg = Config::default();
-        assert_eq!(cfg.context_max_bytes, 64 * 1024);
+        assert_eq!(cfg.context_max_bytes, 8 * 1024);
+        assert_eq!(cfg.context_compact_threshold_percent, 75);
         assert_eq!(cfg.max_format_retries, 2);
         assert_eq!(cfg.breaker_max_failures, 3);
         assert_eq!(cfg.breaker_max_repeats, 3);
