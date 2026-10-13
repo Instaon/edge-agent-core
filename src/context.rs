@@ -70,6 +70,32 @@ impl Context {
         }
     }
 
+    /// Replace the newest entry of `role`. Returns false when that entry is
+    /// missing or is no longer the tail. Used so an operational rejection is
+    /// not what the next model turn reads back.
+    pub fn rewrite_last(&mut self, role: &str, content: &str) -> bool {
+        let Some(index) = self.entries.iter().rposition(|entry| entry.role == role) else {
+            return false;
+        };
+        if index + 1 != self.entries.len() {
+            return false;
+        }
+        let old_cost = self.entries[index].role.len() + self.entries[index].content.len();
+        self.cur_bytes -= old_cost;
+        let room = self.max_bytes.saturating_sub(role.len());
+        let content = truncate_chars(content, room);
+        self.entries[index].content = content;
+        self.cur_bytes += role.len() + self.entries[index].content.len();
+        while self.cur_bytes > self.max_bytes && self.entries.len() > 1 {
+            if let Some(old) = self.entries.pop_front() {
+                self.cur_bytes = self.cur_bytes.saturating_sub(old.role.len() + old.content.len());
+            } else {
+                break;
+            }
+        }
+        true
+    }
+
     pub fn entries(&self) -> impl Iterator<Item = &ContextEntry> {
         self.entries.iter()
     }
@@ -160,6 +186,17 @@ impl Context {
     }
 }
 
+fn truncate_chars(content: &str, max_bytes: usize) -> String {
+    if content.len() <= max_bytes {
+        return content.to_string();
+    }
+    let mut end = max_bytes.min(content.len());
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    content[..end].to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +210,21 @@ mod tests {
         let all: Vec<_> = ctx.entries().map(|e| e.content.as_str()).collect();
         assert_eq!(all, vec!["bbbbbbbbbb", "cccccccccc"]);
         assert!(ctx.byte_len() <= 40);
+    }
+
+    #[test]
+    fn rewrite_last_replaces_only_the_tail_and_keeps_the_budget() {
+        let mut ctx = Context::new(80, 75);
+        ctx.push("user", "开灯");
+        ctx.push("assistant", "request safely rejected (inference error)");
+        assert!(ctx.rewrite_last("assistant", "我这会儿没处理好，麻烦再跟我说一次。"));
+        let all: Vec<_> = ctx.entries().map(|e| e.content.as_str()).collect();
+        assert_eq!(all, vec!["开灯", "我这会儿没处理好，麻烦再跟我说一次。"]);
+        let summed: usize = ctx.entries().map(|e| e.role.len() + e.content.len()).sum();
+        assert_eq!(ctx.byte_len(), summed);
+        assert!(ctx.byte_len() <= 80);
+        ctx.push("user", "下一句");
+        assert!(!ctx.rewrite_last("assistant", "太晚了"));
     }
 
     #[test]

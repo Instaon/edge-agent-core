@@ -334,6 +334,13 @@ impl Kernel {
         outcome
     }
 
+    /// Replace the assistant line just stored for this command. The outcome
+    /// itself stays the operational text for logs; only the next model turn
+    /// reads the replacement.
+    pub fn rewrite_last_assistant(&mut self, content: &str) -> bool {
+        self.ctx.rewrite_last("assistant", content)
+    }
+
     fn execute(&mut self, task: u64, event: &Event) -> TaskOutcome {
         // 1) Strategy first: deterministic rules may finish the task with no model.
         let routed = self.run_strategy(event, "route");
@@ -1060,6 +1067,59 @@ mod tests {
         assert_eq!(u.images[0].mime, "image/png");
         assert_eq!(u.images[0].data, b"disk-png");
         let _ = std::fs::remove_file(&img_path);
+    }
+
+    #[test]
+    fn rewritten_assistant_line_is_what_the_next_turn_reads() {
+        use std::sync::Mutex;
+
+        struct Recorder {
+            seen: Arc<Mutex<Vec<String>>>,
+        }
+        impl InferenceBackend for Recorder {
+            fn generate(
+                &mut self,
+                _system: &str,
+                context: &[crate::context::ContextEntry],
+                input: &UserInput,
+            ) -> anyhow::Result<String> {
+                let prior = context
+                    .iter()
+                    .filter(|entry| entry.role == "assistant")
+                    .map(|entry| entry.content.clone())
+                    .collect::<Vec<_>>()
+                    .join("|");
+                self.seen.lock().expect("recorder").push(prior);
+                Ok(serde_json::json!({ "reply": input.text }).to_string())
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let cfg = Config {
+            dev_allow_unsigned: true,
+            backend: BackendConfig::Mock,
+            ..Default::default()
+        };
+        let mut kernel = Kernel::builder(cfg)
+            .backend(Box::new(Recorder { seen: seen.clone() }))
+            .build()
+            .unwrap();
+        kernel.handle_event(Event {
+            kind: "command".into(),
+            payload: serde_json::json!("第一句"),
+            priority: 1,
+            source: "test".into(),
+        });
+        assert!(kernel.rewrite_last_assistant("我这会儿没处理好，麻烦再跟我说一次。"));
+        kernel.handle_event(Event {
+            kind: "command".into(),
+            payload: serde_json::json!("第二句"),
+            priority: 1,
+            source: "test".into(),
+        });
+        let seen = seen.lock().expect("recorder");
+        assert_eq!(seen[0], "");
+        assert_eq!(seen[1], "我这会儿没处理好，麻烦再跟我说一次。");
     }
 
     #[test]
