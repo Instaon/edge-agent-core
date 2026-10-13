@@ -95,7 +95,7 @@ fn handle(input: Value) -> Value {
         .and_then(extract_reply)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "好的。".to_string());
-    json!({"ok": true, "decision": "rule", "reply": spoken, "thought": "让小蛛去看看。"})
+    json!({"ok": true, "decision": "rule", "reply": spoken, "thought": "把这句话交给小蛛处理。"})
 }
 
 fn matches_keyword(text: &str) -> bool {
