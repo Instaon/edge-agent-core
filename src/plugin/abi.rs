@@ -49,6 +49,9 @@ pub struct ContextView {
 #[serde(deny_unknown_fields)]
 pub struct PluginOutput {
     pub ok: bool,
+    /// Return this tool result to the model instead of ending the task.
+    #[serde(default)]
+    pub continue_inference: bool,
     /// Free-form result payload (tool results, hook data).
     #[serde(default)]
     pub result: serde_json::Value,
@@ -84,6 +87,7 @@ impl PluginOutput {
     pub fn reply(text: impl Into<String>) -> Self {
         Self {
             ok: true,
+            continue_inference: false,
             result: serde_json::Value::Null,
             decision: None,
             reply: Some(text.into()),
@@ -97,6 +101,7 @@ impl PluginOutput {
     pub fn result(value: serde_json::Value) -> Self {
         Self {
             ok: true,
+            continue_inference: false,
             result: value,
             decision: None,
             reply: None,
@@ -107,9 +112,16 @@ impl PluginOutput {
         }
     }
 
+    pub fn continue_with(value: serde_json::Value) -> Self {
+        let mut out = Self::result(value);
+        out.continue_inference = true;
+        out
+    }
+
     pub fn fail(msg: impl Into<String>) -> Self {
         Self {
             ok: false,
+            continue_inference: false,
             result: serde_json::Value::Null,
             decision: None,
             reply: None,
@@ -124,6 +136,7 @@ impl PluginOutput {
     pub fn rule(reply: impl Into<String>) -> Self {
         Self {
             ok: true,
+            continue_inference: false,
             result: serde_json::Value::Null,
             decision: Some("rule".into()),
             reply: Some(reply.into()),
@@ -138,6 +151,7 @@ impl PluginOutput {
     pub fn model() -> Self {
         Self {
             ok: true,
+            continue_inference: false,
             result: serde_json::Value::Null,
             decision: Some("model".into()),
             reply: None,

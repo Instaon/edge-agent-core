@@ -125,7 +125,7 @@ fn smoke_dead_loop_breaker_and_safe_reject() {
     // Repeating identical command payloads produces identical mock output.
     // 1st time: ok
     let o1 = kernel.handle_event(Event {
-        kind: "command".into(),
+        kind: "event".into(),
         payload: serde_json::json!("repeat"),
         priority: 1,
         source: "test".into(),
@@ -134,7 +134,7 @@ fn smoke_dead_loop_breaker_and_safe_reject() {
 
     // 2nd time: ok
     let o2 = kernel.handle_event(Event {
-        kind: "command".into(),
+        kind: "event".into(),
         payload: serde_json::json!("repeat"),
         priority: 1,
         source: "test".into(),
@@ -143,7 +143,7 @@ fn smoke_dead_loop_breaker_and_safe_reject() {
 
     // 3rd time: trips dead loop breaker -> enters fallback -> safe reject
     let o3 = kernel.handle_event(Event {
-        kind: "command".into(),
+        kind: "event".into(),
         payload: serde_json::json!("repeat"),
         priority: 1,
         source: "test".into(),
@@ -154,7 +154,7 @@ fn smoke_dead_loop_breaker_and_safe_reject() {
 
     // After fallback, breaker is reset, so a fresh action succeeds
     let o4 = kernel.handle_event(Event {
-        kind: "command".into(),
+        kind: "event".into(),
         payload: serde_json::json!("different_action"),
         priority: 1,
         source: "test".into(),

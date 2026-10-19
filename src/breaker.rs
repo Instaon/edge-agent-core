@@ -54,6 +54,13 @@ impl Breaker {
         false
     }
 
+    /// A fresh user command may legitimately repeat the previous command.
+    /// Keep failure/open state; only the within-task action loop starts fresh.
+    pub fn begin_command(&mut self) {
+        self.last_action = None;
+        self.action_repeats = 0;
+    }
+
     /// Manual reset, e.g. after a successful fallback answer calmed things down.
     pub fn reset(&mut self) {
         *self = Self::new(self.max_failures, self.max_repeats);
@@ -103,6 +110,20 @@ mod tests {
         // Needs 3 consecutive 200s to trip
         assert!(!b.record_action(200));
         assert!(b.record_action(200));
+        assert!(b.is_open());
+    }
+
+    #[test]
+    fn new_command_resets_repeats_but_preserves_failure_breaker() {
+        let mut b = Breaker::new(2, 3);
+        assert!(!b.record_action(42));
+        assert!(!b.record_action(42));
+        b.record_failure();
+        b.begin_command();
+        assert!(!b.record_action(42));
+        b.record_failure();
+        assert!(b.is_open());
+        b.begin_command();
         assert!(b.is_open());
     }
 

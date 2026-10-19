@@ -12,6 +12,10 @@ pub struct Config {
     pub context_compact_threshold_percent: u8,
     /// Max model-format retries before the circuit breaker trips for this task.
     pub max_format_retries: u32,
+    /// Maximum model/tool steps in one task, including the final action.
+    pub max_tool_steps: u32,
+    /// Explicit ordering for named strategy interceptors; other plugins retain their order.
+    pub strategy_order: Vec<String>,
     /// Consecutive task failures before the kernel enters fallback-only mode.
     pub breaker_max_failures: u32,
     /// Identical consecutive actions treated as a dead loop.
@@ -77,6 +81,8 @@ impl Default for Config {
             context_max_bytes: 8 * 1024,
             context_compact_threshold_percent: 75,
             max_format_retries: 2,
+            max_tool_steps: 6,
+            strategy_order: Vec::new(),
             breaker_max_failures: 3,
             breaker_max_repeats: 3,
             plugin_fuel: 50_000_000,
