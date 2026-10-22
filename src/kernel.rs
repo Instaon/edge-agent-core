@@ -33,6 +33,13 @@ pub struct TaskOutcome {
     pub reply: String,
     /// Which path produced the answer: "rule" | "model" | "tool" | "fallback" | "kernel"
     pub via: String,
+    /// 工具路径产出的最终回话时，是哪个工具、模型给的原参数。宿主据此把
+    /// 该轮历史改写成模型自己的工具调用 JSON——否则历史里只剩确认句文本，
+    /// 下一轮模型会学会跳过工具直接复读确认句。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_args: Option<serde_json::Value>,
 }
 
 impl TaskOutcome {
@@ -41,6 +48,8 @@ impl TaskOutcome {
             status: status.into(),
             reply: reply.into(),
             via: via.into(),
+            tool: None,
+            tool_args: None,
         }
     }
 }
@@ -560,7 +569,7 @@ impl Kernel {
             hook: None,
             event: Some(serde_json::to_value(event).unwrap_or_default()),
             context: None, // filled by invoke_plugin if permitted
-            args,
+            args: args.clone(),
         };
         match self.invoke_plugin(&tool, input) {
             Ok(out) if out.ok => {
@@ -573,11 +582,11 @@ impl Kernel {
                 if out.continue_inference {
                     return TaskOutcome::new("continue", "tool", out.result.to_string());
                 }
-                TaskOutcome::new(
-                    "ok",
-                    "tool",
-                    out.reply.unwrap_or_else(|| out.result.to_string()),
-                )
+                let mut outcome =
+                    TaskOutcome::new("ok", "tool", out.reply.unwrap_or_else(|| out.result.to_string()));
+                outcome.tool = Some(tool);
+                outcome.tool_args = Some(args);
+                outcome
             }
             Ok(out) => {
                 let why = out.error.unwrap_or_else(|| "tool reported failure".into());
