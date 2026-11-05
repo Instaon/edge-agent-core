@@ -120,9 +120,31 @@ let mut kernel = Kernel::builder(Config::default())
         }
     })
     // 钩子：观察者，不影响主流程
-    .register_hook("audit", &["on_degrade", "post_task"], |input: &PluginInput| {
+    .register_hook("audit", &["on_degrade", "post_task", "on_compact"], |input: &PluginInput| {
         eprintln!("[audit] {:?} {:?}", input.hook, input.args);
         Ok(PluginOutput::result(serde_json::Value::Null))
+    })
+    .build()?;
+```
+
+如果策略没有写副作用，还可以通过 `register_strategy_with` 声明 `Concurrency` 契约，让内核将相邻且资源不冲突的策略编入同一批次并行执行；同时也可以通过 `.compactor(...)` 替换请求超预算时的上下文压缩函数：
+
+```rust
+use edge_agent_core::{CompactionRequest, Concurrency, SideEffects, Summarizer};
+
+let mut kernel = Kernel::builder(Config::default())
+    .register_strategy_with(
+        "ambient-sensor",
+        Concurrency {
+            parallel: true,
+            side_effects: SideEffects::Read,
+            resources: vec!["device:camera".into()],
+        },
+        |_input: &PluginInput| Ok(PluginOutput::model()),
+    )?
+    .compactor(|req: &CompactionRequest, summarizer: &mut dyn Summarizer| {
+        // 自定义压缩：也可直接调用 summarizer.summarize(entries, max_bytes)
+        edge_agent_core::budget::SummarizeCompactor.compact(req, summarizer)
     })
     .build()?;
 ```
@@ -340,6 +362,7 @@ extern "C" { fn host_log(ptr: *const u8, len: usize); }
 - `version` 必须是合法 semver（`x.y.z`）。
 - `context: true` 会让插件在每次调用时都收到完整对话历史副本——不需要就别开，减少插件能看到的数据面。
 - `capabilities` 只列这个插件真正要用的能力，声明越少，攻击面越小；分发时签名会覆盖这个列表，事后改不了。
+- 策略插件（`kind: "strategy"`）可选声明 `"concurrency": {"parallel": true, "side_effects": "none" | "read", "resources": [...]}`：声明后会被纳入签名范围并参与并行批次调度；未声明时默认视为黑盒串行执行。
 
 ## 4. 编译与本地测试
 
