@@ -24,6 +24,7 @@ src/
 ├── kernel.rs            主循环与降级链（核心，所有路径在此汇合）
 ├── event.rs             统一事件入口：优先级队列
 ├── context.rs           对话上下文：8KB 硬预算，闲时摘要早期条目
+├── budget.rs            请求预算与可插拔上下文压缩：完整请求预算检查、结果校验、整条消息淘汰
 ├── lock.rs              资源锁：同一设备任一时刻只被一个任务控制
 ├── breaker.rs           熔断器：连续失败 / 重复动作计数
 ├── inference.rs         多模态推理后端 trait + Mock / OpenAI 兼容 / LiteRT-LM 实现

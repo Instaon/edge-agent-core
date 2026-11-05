@@ -83,7 +83,7 @@ echo '{"kind":"command","payload":"hello"}' | cargo run --bin edge-agent
 
 - **`trusted_pubkey` 为空且 `dev_allow_unsigned=false` 时，任何插件都加载不了。** 内核不会报错崩溃，只是插件列表为空，行为上看起来像"策略/工具都不生效，全部走模型直连"。排查时先看启动日志里的 `[registry]` 行。
 - **`dev_allow_unsigned: true` 仅用于开发。** 生产设备上打开这个开关等于放弃零信任验签，framework 不会替你拦截，因为这是显式配置项。
-- **`context_max_bytes` 默认 8KB；`context_compact_threshold_percent` 默认 75。** 宿主可在闲时取候选、后台摘要并提交旧对话；内核自带 stdin runner 不主动摘要，突发超限或摘要不可用时仍 FIFO 丢旧条目。只有声明了 `permissions.context: true` 的插件才能看到上下文。
+- **`context_max_bytes` 默认 8KB；`context_compact_threshold_percent` 默认 75；`request_max_bytes` 默认 32KB（含 `response_reserve_bytes` 默认 1KB）。** 每次模型调用前内核都会统一检查完整请求预算：超限时执行压缩（`context_compaction: "summarize" | "evict"` 或 `KernelBuilder::compactor` 注入）并校验结果，失败则按完整旧消息淘汰，仍装不下则明确失败降级。只有声明了 `permissions.context: true` 的插件才能看到上下文。
 - **一个任务里工具调用失败不会自动重试**，会直接进入降级链（策略 fallback → 安全拒绝）。如果你的工具本身有瞬时性错误（比如串口偶发超时），重试逻辑要写在工具插件内部或者 `HostBridge` 实现里，内核不做这个决定。
 - **`plugin_fuel` 太小会让复杂计算的插件被中途打断**，且不会有清晰的"超时"提示——燃料耗尽在 wasmtime 里表现为一次 trap，`invoke_plugin` 会把它当成插件失败计入健康统计。刚开始调试插件时可以把这个值调大（比如 5 亿），稳定后再收紧。
 
@@ -273,6 +273,7 @@ pub extern "C" fn ea_handle(ptr: i32, len: i32) -> i64 {
 | --- | --- | --- |
 | `on_degrade` | 降级链被触发（熔断、格式重试耗尽、工具失败等） | `{"reason": "原因"}` |
 | `on_rollback` | 某插件因连续失败被自动禁用回滚（延迟到任务边界触发） | `{"plugin": 名}` |
+| `on_compact` | 请求预算超限触发上下文压缩或整条消息淘汰 | `{"method": "summary"\|"evict", "before_bytes", "after_bytes", "budget_bytes", "error"}` |
 
 几个值得注意的点：
 

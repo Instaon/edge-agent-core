@@ -19,6 +19,10 @@ pub struct Manifest {
     pub hooks: Vec<String>,
     #[serde(default)]
     pub permissions: Permissions,
+    /// Strategy concurrency declaration (kind == "strategy" only). Absent
+    /// means "black box": the kernel runs the strategy strictly serially.
+    #[serde(default, skip_serializing_if = "Concurrency::is_default")]
+    pub concurrency: Concurrency,
     /// Hex ed25519 signature. Absent only in dev_allow_unsigned mode.
     #[serde(default)]
     pub signature: Option<String>,
@@ -42,6 +46,84 @@ pub struct Permissions {
     pub capabilities: Vec<String>,
 }
 
+/// What a strategy does to the outside world. Ordered from weakest to
+/// strongest; the default is the conservative `Write`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SideEffects {
+    /// Pure function of its input: no `host_call` is reachable.
+    None,
+    /// Observes declared resources but changes nothing outside the kernel.
+    Read,
+    /// May change the world (actuate devices, send messages...).
+    #[default]
+    Write,
+}
+
+/// Concurrency contract a strategy declares. The kernel trusts nothing it
+/// cannot enforce: a parallel strategy only reaches the resources it lists,
+/// a side-effect-free one reaches none, and writers are never parallel.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Concurrency {
+    /// The strategy may run concurrently with other parallel strategies
+    /// (including speculatively, before earlier strategies have decided).
+    pub parallel: bool,
+    pub side_effects: SideEffects,
+    /// Every resource the strategy touches (capabilities such as
+    /// "device:camera" or logical names). Two strategies sharing a resource
+    /// never run in the same parallel batch.
+    pub resources: Vec<String>,
+}
+
+impl Concurrency {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// A parallel declaration is enforceable only when it is honest about
+    /// effects and footprint. `caps` are the capabilities the plugin may
+    /// otherwise reach through `host_call` (empty for native plugins).
+    pub fn validate(&self, caps: &[String]) -> anyhow::Result<()> {
+        if !self.parallel {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.side_effects != SideEffects::Write,
+            "a strategy with write side effects cannot be declared parallel"
+        );
+        if self.side_effects == SideEffects::Read {
+            if let Some(cap) = caps.iter().find(|c| !self.resources.contains(c)) {
+                anyhow::bail!(
+                    "capability '{cap}' is not listed in concurrency.resources of a parallel strategy"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Capabilities a parallel strategy may actually reach at runtime.
+    /// Non-parallel strategies keep their full manifest capability set.
+    pub fn effective_caps(&self, caps: &[String]) -> Vec<String> {
+        if !self.parallel {
+            return caps.to_vec();
+        }
+        match self.side_effects {
+            SideEffects::None => Vec::new(),
+            _ => caps
+                .iter()
+                .filter(|c| self.resources.contains(c))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// Whether the scheduler may place this strategy in a parallel batch.
+    pub fn parallel_eligible(&self) -> bool {
+        self.parallel && self.side_effects != SideEffects::Write
+    }
+}
+
 impl Manifest {
     /// The exact bytes the distribution signature covers.
     pub fn signing_payload(&self, wasm: &[u8]) -> Vec<u8> {
@@ -50,7 +132,7 @@ impl Manifest {
         caps.sort();
         let mut hooks = self.hooks.clone();
         hooks.sort();
-        let canonical = serde_json::json!({
+        let mut canonical = serde_json::json!({
             "name": self.name,
             "version": self.version,
             "kind": self.kind,
@@ -59,7 +141,30 @@ impl Manifest {
             "capabilities": caps,
             "wasm_sha256": hex::encode(wasm_hash),
         });
+        // The concurrency contract widens what the scheduler will do, so it is
+        // signed with the code. Omitted when absent to keep old signatures valid.
+        if !self.concurrency.is_default() {
+            let mut resources = self.concurrency.resources.clone();
+            resources.sort();
+            canonical["concurrency"] = serde_json::json!({
+                "parallel": self.concurrency.parallel,
+                "side_effects": self.concurrency.side_effects,
+                "resources": resources,
+            });
+        }
         canonical.to_string().into_bytes()
+    }
+
+    /// Structural checks beyond the JSON schema, run at load time.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.concurrency.is_default() {
+            anyhow::ensure!(
+                self.kind == PluginKind::Strategy,
+                "concurrency is only meaningful for strategy plugins"
+            );
+            self.concurrency.validate(&self.permissions.capabilities)?;
+        }
+        Ok(())
     }
 
     pub fn verify(&self, wasm: &[u8], pubkey: &VerifyingKey) -> anyhow::Result<()> {
@@ -102,6 +207,7 @@ mod tests {
                 context: false,
                 capabilities: vec!["device:relay0".into()],
             },
+            concurrency: Concurrency::default(),
             signature: None,
         };
         let sig = key.sign(&m.signing_payload(wasm));
@@ -126,6 +232,7 @@ mod tests {
             kind: PluginKind::Tool,
             hooks: vec![],
             permissions: Permissions::default(),
+            concurrency: Concurrency::default(),
             signature: None,
         };
         let sig = key.sign(&m.signing_payload(wasm_original));
@@ -163,6 +270,7 @@ mod tests {
                 context: true,
                 capabilities: vec!["b_cap".into(), "a_cap".into()],
             },
+            concurrency: Concurrency::default(),
             signature: None,
         };
         let m2 = Manifest {
@@ -174,9 +282,94 @@ mod tests {
                 context: true,
                 capabilities: vec!["a_cap".into(), "b_cap".into()],
             },
+            concurrency: Concurrency::default(),
             signature: None,
         };
         // Payload must be identical regardless of original vec order
         assert_eq!(m1.signing_payload(wasm), m2.signing_payload(wasm));
+    }
+
+    fn strategy(concurrency: Concurrency, caps: &[&str]) -> Manifest {
+        Manifest {
+            name: "s".into(),
+            version: "1.0.0".into(),
+            kind: PluginKind::Strategy,
+            hooks: vec![],
+            permissions: Permissions {
+                context: false,
+                capabilities: caps.iter().map(|c| c.to_string()).collect(),
+            },
+            concurrency,
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn absent_concurrency_keeps_legacy_payload_and_parses() {
+        let raw = r#"{"name":"s","version":"1.0.0","kind":"strategy"}"#;
+        let m: Manifest = serde_json::from_str(raw).unwrap();
+        assert!(m.concurrency.is_default());
+        assert!(!m.concurrency.parallel_eligible());
+        let payload = String::from_utf8(m.signing_payload(b"w")).unwrap();
+        assert!(!payload.contains("concurrency"));
+    }
+
+    #[test]
+    fn concurrency_declaration_is_signed() {
+        let key = SigningKey::generate(&mut rand_core::OsRng);
+        let mut m = strategy(
+            Concurrency {
+                parallel: true,
+                side_effects: SideEffects::Read,
+                resources: vec!["device:camera".into()],
+            },
+            &["device:camera"],
+        );
+        m.signature = Some(hex::encode(key.sign(&m.signing_payload(b"w")).to_bytes()));
+        assert!(m.verify(b"w", &key.verifying_key()).is_ok());
+        // Upgrading a serial strategy to parallel after signing must fail.
+        m.concurrency.side_effects = SideEffects::None;
+        assert!(m.verify(b"w", &key.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn concurrency_validation_rules() {
+        let parallel = |side_effects, resources: &[&str]| Concurrency {
+            parallel: true,
+            side_effects,
+            resources: resources.iter().map(|r| r.to_string()).collect(),
+        };
+        // Writers are never parallel.
+        assert!(
+            strategy(parallel(SideEffects::Write, &[]), &[])
+                .validate()
+                .is_err()
+        );
+        // Readers must list every capability they can reach.
+        assert!(
+            strategy(parallel(SideEffects::Read, &[]), &["device:camera"])
+                .validate()
+                .is_err()
+        );
+        assert!(
+            strategy(
+                parallel(SideEffects::Read, &["device:camera"]),
+                &["device:camera"]
+            )
+            .validate()
+            .is_ok()
+        );
+        // Pure strategies may keep caps; they simply lose them when parallel.
+        let pure = parallel(SideEffects::None, &[]);
+        assert!(
+            strategy(pure.clone(), &["device:buzzer"])
+                .validate()
+                .is_ok()
+        );
+        assert!(pure.effective_caps(&["device:buzzer".into()]).is_empty());
+        // Only strategies may declare concurrency.
+        let mut tool = strategy(pure, &[]);
+        tool.kind = PluginKind::Tool;
+        assert!(tool.validate().is_err());
     }
 }

@@ -11,7 +11,7 @@
 //! collision the native registration wins: in-tree code beats disk artifacts.
 
 use super::abi::{PluginInput, PluginOutput};
-use super::manifest::PluginKind;
+use super::manifest::{Concurrency, PluginKind};
 use std::collections::HashMap;
 
 /// Implement this (or just use a closure — any
@@ -36,6 +36,9 @@ struct Entry {
     /// `device:*` resources locked for the duration of a tool invocation —
     /// same arbitration as wasm tools declare via their manifest.
     devices: Vec<String>,
+    /// Strategy concurrency contract. Native code is trusted, so the kernel
+    /// schedules on the declaration without sandbox enforcement.
+    concurrency: Concurrency,
     plugin: Box<dyn NativePlugin>,
 }
 
@@ -57,6 +60,7 @@ impl NativeRegistry {
                 kind: PluginKind::Tool,
                 hooks: vec![],
                 devices: devices.iter().map(|d| d.to_string()).collect(),
+                concurrency: Concurrency::default(),
                 plugin: Box::new(plugin),
             },
         );
@@ -69,9 +73,50 @@ impl NativeRegistry {
                 kind: PluginKind::Strategy,
                 hooks: vec![],
                 devices: vec![],
+                concurrency: Concurrency::default(),
                 plugin: Box::new(plugin),
             },
         );
+    }
+
+    /// Register a strategy with an explicit concurrency contract. The
+    /// declaration is validated the same way as a wasm manifest's.
+    pub fn register_strategy_with(
+        &mut self,
+        name: &str,
+        concurrency: Concurrency,
+        plugin: impl NativePlugin + 'static,
+    ) -> anyhow::Result<()> {
+        concurrency.validate(&[])?;
+        self.entries.insert(
+            name.to_string(),
+            Entry {
+                kind: PluginKind::Strategy,
+                hooks: vec![],
+                devices: vec![],
+                concurrency,
+                plugin: Box::new(plugin),
+            },
+        );
+        Ok(())
+    }
+
+    /// Concurrency contract of a native strategy.
+    pub fn strategy_concurrency(&self, name: &str) -> Option<&Concurrency> {
+        self.entries
+            .get(name)
+            .filter(|e| e.kind == PluginKind::Strategy)
+            .map(|e| &e.concurrency)
+    }
+
+    /// Disjoint mutable handles to several plugins at once, so a parallel
+    /// batch can run them on separate threads.
+    pub fn plugins_mut(&mut self, names: &[String]) -> HashMap<String, &mut dyn NativePlugin> {
+        self.entries
+            .iter_mut()
+            .filter(|(n, _)| names.contains(n))
+            .map(|(n, e)| (n.clone(), e.plugin.as_mut() as &mut dyn NativePlugin))
+            .collect()
     }
 
     pub fn register_hook(
@@ -86,6 +131,7 @@ impl NativeRegistry {
                 kind: PluginKind::Hook,
                 hooks: points.iter().map(|p| p.to_string()).collect(),
                 devices: vec![],
+                concurrency: Concurrency::default(),
                 plugin: Box::new(plugin),
             },
         );
