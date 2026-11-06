@@ -142,7 +142,7 @@ event
 TaskOutcome { status, reply, via }
 ```
 
-任务级流程之外还有两个内核级挂载点：`kernel_start`（内核启动、插件扫描完成后）和 `kernel_stop`（业务调用 `Kernel::shutdown` 时），全部 12 个挂载点的清单和各点携带的数据见 [03-usage.md](03-usage.md)。
+任务级流程之外还有两个内核级挂载点：`kernel_start`（内核启动、插件扫描完成后）和 `kernel_stop`（业务调用 `Kernel::shutdown` 时），以及按需触发的 `on_compact`（请求预算超限触发上下文压缩或淘汰时），全部 13 个挂载点的清单和各点携带的数据见 [03-usage.md](03-usage.md)。
 
 `status` 取值：`ok`（正常完成）/ `busy`（资源被占用，拒绝而非排队等待）/ `rejected`（降级链兜底后仍无法处理）/ `error`（内核级异常，如插件重载失败）。
 `via` 标明答案来自哪一级：`rule` / `model` / `tool` / `fallback` / `kernel`。业务日志和排障应始终关注这个字段。
@@ -179,6 +179,8 @@ invoke_plugin(name, input)
 内核是**单线程同步主循环**：`run_pending()` 逐个 `pop` 事件顺序处理。这本身就是并发仲裁的第一层——不存在两个任务同时跑的情况。
 
 在此基础上，`ResourceLocks`（[lock.rs](../src/lock.rs)）解决的是"任务内部对物理设备的占用"问题：一个工具调用声明了 `device:relay0`，执行期间这把锁归当前任务持有；如果同一资源已被占用（理论上只会发生在未来引入并发执行模型时，或工具嵌套调用时），内核**立即返回 busy，不排队、不抢占**。要不要重试、要不要抢占，是业务在收到 `busy` 之后自己决定的策略，不是内核的职责。
+
+对于**策略链**，未声明并发契约的策略被视为黑盒，严格串行执行；只有显式声明了 `concurrency.parallel = true`、副作用为 `none` 或 `read`、且声明资源互不冲突的相邻策略，才会被框架编入同一并行批次（上限受 `strategy_max_parallel` 约束）并发执行，结果仍严格按策略链顺序归并。写副作用策略不允许声明并行；纯函数策略运行时无法访问任何 `host_call` 能力，只读策略仅能访问 `concurrency.resources` 声明的能力。
 
 ## 5. 稳定性防线如何互相配合
 

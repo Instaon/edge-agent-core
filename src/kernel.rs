@@ -7,21 +7,26 @@
 //!   → safe reject. Every stage is deterministic.
 
 use crate::breaker::Breaker;
-use crate::config::{BackendConfig, Config};
-use crate::context::{Context, ContextCompaction};
+use crate::budget::{
+    self, BudgetExceeded, CompactionRequest, ContextCompactor, RequestBudget, SummarizeCompactor,
+    Summarizer,
+};
+use crate::config::{BackendConfig, CompactionMode, Config};
+use crate::context::{Context, ContextCompaction, ContextEntry};
 use crate::event::{Event, EventQueue};
 use crate::inference::{
     ImagePart, InferenceBackend, LitertLmBackend, MockBackend, OpenAiBackend, UserInput,
 };
 use crate::lock::ResourceLocks;
 use crate::plugin::abi::{ContextView, PluginInput, PluginOutput};
-use crate::plugin::manifest::parse_pubkey;
+use crate::plugin::manifest::{Concurrency, parse_pubkey};
 use crate::plugin::native::{NativePlugin, NativeRegistry};
 use crate::plugin::registry::{Registry, ScanOptions};
 use crate::plugin::runtime::{HostBridge, NullBridge, PluginRuntime};
 use base64::Engine as _;
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -104,6 +109,9 @@ pub struct Kernel {
     /// Rollbacks detected mid-invocation; `on_rollback` hooks fire at the
     /// next safe boundary to avoid re-entering the plugin runtime.
     pending_rollbacks: Vec<String>,
+    /// Runs when a model request exceeds `request_max_bytes`. `None` means
+    /// eviction only (`context_compaction: "evict"` without an override).
+    compactor: Option<Box<dyn ContextCompactor>>,
 }
 
 /// Assembles a kernel: config, hardware bridge, an optional injected
@@ -114,6 +122,7 @@ pub struct KernelBuilder {
     cfg: Config,
     bridge: Option<Arc<dyn HostBridge>>,
     backend_override: Option<Box<dyn InferenceBackend>>,
+    compactor_override: Option<Box<dyn ContextCompactor>>,
     native: NativeRegistry,
 }
 
@@ -147,6 +156,28 @@ impl KernelBuilder {
         self
     }
 
+    /// Register a strategy together with its concurrency contract, letting
+    /// the kernel batch it with other parallel-safe strategies. Fails on a
+    /// contract the kernel cannot honour (e.g. parallel + write effects).
+    pub fn register_strategy_with(
+        mut self,
+        name: &str,
+        concurrency: Concurrency,
+        plugin: impl NativePlugin + 'static,
+    ) -> anyhow::Result<Self> {
+        self.native
+            .register_strategy_with(name, concurrency, plugin)?;
+        Ok(self)
+    }
+
+    /// Replace the compaction function used when a model request exceeds
+    /// its budget. Takes precedence over `cfg.context_compaction`. Its
+    /// output is still validated; unusable results fall back to eviction.
+    pub fn compactor(mut self, compactor: impl ContextCompactor + 'static) -> Self {
+        self.compactor_override = Some(Box::new(compactor));
+        self
+    }
+
     pub fn register_hook(
         mut self,
         name: &str,
@@ -158,7 +189,13 @@ impl KernelBuilder {
     }
 
     pub fn build(self) -> anyhow::Result<Kernel> {
-        Kernel::assemble(self.cfg, self.bridge, self.backend_override, self.native)
+        Kernel::assemble(
+            self.cfg,
+            self.bridge,
+            self.backend_override,
+            self.compactor_override,
+            self.native,
+        )
     }
 }
 
@@ -168,18 +205,20 @@ impl Kernel {
             cfg,
             bridge: None,
             backend_override: None,
+            compactor_override: None,
             native: NativeRegistry::default(),
         }
     }
 
     pub fn new(cfg: Config, bridge: Option<Arc<dyn HostBridge>>) -> anyhow::Result<Self> {
-        Self::assemble(cfg, bridge, None, NativeRegistry::default())
+        Self::assemble(cfg, bridge, None, None, NativeRegistry::default())
     }
 
     fn assemble(
         cfg: Config,
         bridge: Option<Arc<dyn HostBridge>>,
         backend_override: Option<Box<dyn InferenceBackend>>,
+        compactor_override: Option<Box<dyn ContextCompactor>>,
         native: NativeRegistry,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
@@ -190,6 +229,16 @@ impl Kernel {
             (1..=99).contains(&cfg.context_compact_threshold_percent),
             "context_compact_threshold_percent must be between 1 and 99"
         );
+        anyhow::ensure!(
+            cfg.request_max_bytes > cfg.response_reserve_bytes,
+            "request_max_bytes must exceed response_reserve_bytes"
+        );
+        let compactor = compactor_override.or_else(|| match cfg.context_compaction {
+            CompactionMode::Summarize => {
+                Some(Box::new(SummarizeCompactor) as Box<dyn ContextCompactor>)
+            }
+            CompactionMode::Evict => None,
+        });
         let infer = match backend_override {
             Some(backend) => InferencePath::Native(backend),
             None => match &cfg.backend {
@@ -248,6 +297,7 @@ impl Kernel {
             cfg,
             task_seq: 0,
             pending_rollbacks: Vec::new(),
+            compactor,
         };
         let loaded = kernel.registry.names();
         kernel.run_hooks(
@@ -443,6 +493,11 @@ impl Kernel {
                 let raw = match self.infer_once(&system, &user_input) {
                     Ok(r) => r,
                     Err(e) => {
+                        // Over budget is deterministic: retrying the same
+                        // request cannot help, so degrade with the reason.
+                        if let Some(over) = e.downcast_ref::<BudgetExceeded>() {
+                            return self.fallback(event, &over.to_string());
+                        }
                         last_err = format!("inference error: {e:#}");
                         continue;
                     }
@@ -582,8 +637,11 @@ impl Kernel {
                 if out.continue_inference {
                     return TaskOutcome::new("continue", "tool", out.result.to_string());
                 }
-                let mut outcome =
-                    TaskOutcome::new("ok", "tool", out.reply.unwrap_or_else(|| out.result.to_string()));
+                let mut outcome = TaskOutcome::new(
+                    "ok",
+                    "tool",
+                    out.reply.unwrap_or_else(|| out.result.to_string()),
+                );
                 outcome.tool = Some(tool);
                 outcome.tool_args = Some(args);
                 outcome
@@ -638,21 +696,165 @@ impl Kernel {
         )
     }
 
-    /// One inference attempt via whichever path is configured. The wasm path
-    /// goes through the same `invoke_plugin` funnel as everything else:
-    /// permission-filtered context, budgets, health accounting.
+    /// One inference attempt. The complete request is brought under
+    /// `request_max_bytes` first (compaction → eviction → explicit failure),
+    /// so no backend ever receives an over-budget request.
     fn infer_once(&mut self, system: &str, input: &UserInput) -> anyhow::Result<String> {
+        let history = self.fit_request(system, input)?;
+        self.infer_raw(system, &history, input)
+    }
+
+    fn request_budget(&self) -> RequestBudget {
+        RequestBudget {
+            max_bytes: self.cfg.request_max_bytes,
+            reserve_bytes: self.cfg.response_reserve_bytes,
+            image_cost_bytes: self.cfg.request_image_cost_bytes,
+        }
+    }
+
+    /// Kernel-owned budget check for one model request. Returns the history
+    /// to send. A validated summary replaces the stored context (it is a
+    /// faithful substitute); eviction only shapes this request, so one
+    /// oversized turn does not permanently erase the conversation.
+    fn fit_request(
+        &mut self,
+        system: &str,
+        input: &UserInput,
+    ) -> anyhow::Result<Vec<ContextEntry>> {
+        let history = self.ctx.snapshot();
+        let history_budget = self.request_budget().history_budget(system, input)?;
+        let before = budget::history_cost(&history);
+        if before <= history_budget {
+            return Ok(history);
+        }
+
+        let mut compactor_error = None;
+        let compacted = match self.compactor.take() {
+            Some(mut compactor) => {
+                let req = CompactionRequest {
+                    entries: &history,
+                    budget_bytes: history_budget,
+                    keep_recent: self.cfg.compaction_keep_recent,
+                };
+                let result = compactor
+                    .compact(&req, &mut ModelSummarizer { kernel: self })
+                    .and_then(|out| {
+                        budget::validate_compaction(&history, &out, history_budget)?;
+                        Ok(out)
+                    });
+                self.compactor = Some(compactor);
+                match result {
+                    Ok(out) => Some(out),
+                    Err(e) => {
+                        eprintln!("[kernel] context compaction failed, evicting: {e:#}");
+                        compactor_error = Some(format!("{e:#}"));
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        let (method, fitted) = match compacted {
+            Some(out) => {
+                self.ctx.replace_entries(out.clone());
+                ("summary", out)
+            }
+            None => ("evict", budget::evict_to_fit(&history, history_budget)),
+        };
+        let after = budget::history_cost(&fitted);
+        self.run_hooks(
+            "on_compact",
+            None,
+            serde_json::json!({
+                "method": method,
+                "before_bytes": before,
+                "after_bytes": after,
+                "budget_bytes": history_budget,
+                "error": compactor_error,
+            }),
+        );
+        // Unreachable while eviction can empty the history, kept so the
+        // contract "still over budget => explicit failure" holds locally.
+        if after > history_budget {
+            return Err(BudgetExceeded {
+                required: self.request_budget().fixed_cost(system, input) + after,
+                limit: self.cfg.request_max_bytes,
+            }
+            .into());
+        }
+        Ok(fitted)
+    }
+
+    /// Default summarizer: asks the configured model for a plain-text
+    /// summary. The summary request is budgeted like any other.
+    fn summarize_with_model(
+        &mut self,
+        entries: &[ContextEntry],
+        max_bytes: usize,
+    ) -> anyhow::Result<String> {
+        let system = format!(
+            "You compress conversation history for an edge device agent. \
+             Summarize the facts, user preferences and open requests in the \
+             conversation's own language. Output only the summary text, at most \
+             {max_bytes} bytes."
+        );
+        // The summary request is budgeted like any other: when the old
+        // history alone is too large, summarize the newest whole messages
+        // that fit (the oldest are the least valuable to keep).
+        let room = self
+            .request_budget()
+            .history_budget(&system, &UserInput::default())?;
+        let mut lines: Vec<String> = Vec::new();
+        let mut used = 0;
+        for e in entries.iter().rev() {
+            let line = format!("{}: {}", e.role, e.content);
+            let cost = line.len() + usize::from(!lines.is_empty());
+            if used + cost > room {
+                break;
+            }
+            used += cost;
+            lines.push(line);
+        }
+        anyhow::ensure!(
+            !lines.is_empty(),
+            "no old message fits the summary request budget"
+        );
+        lines.reverse();
+        let input = UserInput::text(lines.join("\n"));
+        let raw = self.infer_raw(&system, &[], &input)?;
+        // Backends tuned for the command protocol may still wrap the text.
+        let text = parse_model_command(&raw)
+            .ok()
+            .and_then(|cmd| cmd.reply)
+            .unwrap_or(raw);
+        let text = text.trim();
+        anyhow::ensure!(
+            text.len() <= max_bytes,
+            "summary is {} bytes, limit {max_bytes}",
+            text.len()
+        );
+        Ok(text.to_string())
+    }
+
+    /// Send one already-budgeted request via whichever path is configured.
+    /// The wasm path goes through the same `invoke_plugin` funnel as
+    /// everything else: permission-filtered context, budgets, health accounting.
+    fn infer_raw(
+        &mut self,
+        system: &str,
+        history: &[ContextEntry],
+        input: &UserInput,
+    ) -> anyhow::Result<String> {
         let plugin = match &self.infer {
             InferencePath::Plugin(name) => Some(name.clone()),
             InferencePath::Native(_) => None,
         };
         match plugin {
             None => {
-                let ctx: Vec<_> = self.ctx.entries().cloned().collect();
                 let InferencePath::Native(backend) = &mut self.infer else {
                     unreachable!()
                 };
-                backend.generate(system, &ctx, input)
+                backend.generate(system, history, input)
             }
             Some(name) => {
                 // Images cross the sandbox boundary as base64 copies.
@@ -670,7 +872,9 @@ impl Kernel {
                     kind: "infer".into(),
                     hook: None,
                     event: None,
-                    context: None, // filled by invoke_plugin if the manifest permits
+                    // The budgeted history; invoke_plugin drops it again
+                    // unless the manifest permits context.
+                    context: Some(context_view(history)),
                     args: serde_json::json!({
                         "system": system,
                         "input": input.text,
@@ -731,6 +935,55 @@ impl Kernel {
         names
     }
 
+    /// Concurrency contract of a strategy; native wins on a name collision,
+    /// mirroring `invoke_plugin`. Unknown or undeclared means serial.
+    fn strategy_concurrency(&self, name: &str) -> Concurrency {
+        if self.native.contains(name) {
+            return self
+                .native
+                .strategy_concurrency(name)
+                .cloned()
+                .unwrap_or_default();
+        }
+        self.registry
+            .get(name)
+            .map(|p| p.manifest.concurrency.clone())
+            .unwrap_or_default()
+    }
+
+    /// Split the ordered chain into batches. Consecutive parallel-eligible
+    /// strategies share a batch while their declared resources are disjoint
+    /// and the batch is below `strategy_max_parallel`; anything else runs
+    /// alone. Chain order is preserved inside and across batches.
+    fn plan_strategy_batches(&self, names: &[String]) -> Vec<Vec<String>> {
+        let max = self.cfg.strategy_max_parallel.max(1);
+        let mut batches = Vec::new();
+        let mut current: Vec<String> = Vec::new();
+        let mut used: HashSet<String> = HashSet::new();
+        for name in names {
+            let decl = self.strategy_concurrency(name);
+            if max == 1 || !decl.parallel_eligible() {
+                if !current.is_empty() {
+                    batches.push(std::mem::take(&mut current));
+                    used.clear();
+                }
+                batches.push(vec![name.clone()]);
+                continue;
+            }
+            let conflict = decl.resources.iter().any(|r| used.contains(r));
+            if conflict || current.len() >= max {
+                batches.push(std::mem::take(&mut current));
+                used.clear();
+            }
+            used.extend(decl.resources.iter().cloned());
+            current.push(name.clone());
+        }
+        if !current.is_empty() {
+            batches.push(current);
+        }
+        batches
+    }
+
     fn run_strategy(&mut self, event: &Event, phase: &str) -> StrategyRoute {
         let names = self.strategy_chain_names();
         if names.is_empty() {
@@ -740,70 +993,84 @@ impl Kernel {
                 chain: Vec::new(),
             };
         }
+        // Image bytes stay in the trusted host. Strategies get metadata
+        // and request image analysis through a capability instead of
+        // copying multi-megabyte base64 payloads into Wasm memory.
+        let mut plugin_event = serde_json::to_value(event).unwrap_or_default();
+        if let Some(payload) = plugin_event.get_mut("payload") {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.remove("images");
+            }
+        }
+        let input = PluginInput {
+            kind: "strategy".into(),
+            hook: None,
+            event: Some(plugin_event),
+            context: None,
+            args: serde_json::json!({ "phase": phase }),
+        };
         // First `decision: "rule"` wins. `"model"` (or a failed plugin) continues
         // down the chain so a miss / network error can fall through to the next
-        // strategy and eventually the model path.
+        // strategy and eventually the model path. Parallel batches run their
+        // members concurrently (speculatively — only side-effect-free or
+        // read-only strategies are eligible), but results are folded strictly
+        // in chain order, so the outcome equals the serial run.
         let mut last_model: Option<PluginOutput> = None;
         let mut chain = Vec::new();
-        for name in names {
-            // Image bytes stay in the trusted host. Strategies get metadata
-            // and request image analysis through a capability instead of
-            // copying multi-megabyte base64 payloads into Wasm memory.
-            let mut plugin_event = serde_json::to_value(event).unwrap_or_default();
-            if let Some(payload) = plugin_event.get_mut("payload") {
-                if let Some(obj) = payload.as_object_mut() {
-                    obj.remove("images");
-                }
+        let mut results = std::collections::VecDeque::new();
+        for batch in self.plan_strategy_batches(&names) {
+            if batch.len() == 1 {
+                let name = batch.into_iter().next().unwrap_or_default();
+                let result = self.invoke_plugin(&name, input.clone());
+                results.push_back((name, result));
+            } else {
+                results.extend(self.invoke_strategies_parallel(&batch, &input));
             }
-            let input = PluginInput {
-                kind: "strategy".into(),
-                hook: None,
-                event: Some(plugin_event),
-                context: None,
-                args: serde_json::json!({ "phase": phase }),
-            };
-            match self.invoke_plugin(&name, input) {
-                Ok(mut out) if out.ok && out.decision.as_deref() == Some("rule") => {
-                    chain.push((name.clone(), "rule".into()));
-                    // An earlier strategy may have acted and deliberately
-                    // continued so a later strategy can handle this event.
-                    // Keep both observations without changing the winner's fields.
-                    if let Some(previous) = last_model.as_ref().and_then(|o| o.observation.as_ref())
-                    {
-                        if let Some(current) = out.observation.as_mut() {
-                            if let Some(object) = current.as_object_mut() {
-                                if !object.contains_key("mindstream_know") {
-                                    if let Some(know) = previous.get("mindstream_know") {
-                                        object.insert("mindstream_know".into(), know.clone());
+            while let Some((name, result)) = results.pop_front() {
+                match result {
+                    Ok(mut out) if out.ok && out.decision.as_deref() == Some("rule") => {
+                        chain.push((name.clone(), "rule".into()));
+                        // An earlier strategy may have acted and deliberately
+                        // continued so a later strategy can handle this event.
+                        // Keep both observations without changing the winner's fields.
+                        if let Some(previous) =
+                            last_model.as_ref().and_then(|o| o.observation.as_ref())
+                        {
+                            if let Some(current) = out.observation.as_mut() {
+                                if let Some(object) = current.as_object_mut() {
+                                    if !object.contains_key("mindstream_know") {
+                                        if let Some(know) = previous.get("mindstream_know") {
+                                            object.insert("mindstream_know".into(), know.clone());
+                                        }
                                     }
+                                    object.insert("prior_observation".into(), previous.clone());
                                 }
-                                object.insert("prior_observation".into(), previous.clone());
+                            } else {
+                                out.observation = Some(previous.clone());
                             }
-                        } else {
-                            out.observation = Some(previous.clone());
                         }
+                        return StrategyRoute {
+                            output: Some(out),
+                            winner: Some(name),
+                            chain,
+                        };
                     }
-                    return StrategyRoute {
-                        output: Some(out),
-                        winner: Some(name),
-                        chain,
-                    };
-                }
-                Ok(mut out) if out.ok => {
-                    let d = out.decision.clone().unwrap_or_else(|| "model".into());
-                    chain.push((name, d));
-                    if let Some(previous) = last_model.as_ref() {
-                        if out.model_context.is_none() {
-                            out.model_context = previous.model_context.clone();
+                    Ok(mut out) if out.ok => {
+                        let d = out.decision.clone().unwrap_or_else(|| "model".into());
+                        chain.push((name, d));
+                        if let Some(previous) = last_model.as_ref() {
+                            if out.model_context.is_none() {
+                                out.model_context = previous.model_context.clone();
+                            }
+                            if out.observation.is_none() {
+                                out.observation = previous.observation.clone();
+                            }
                         }
-                        if out.observation.is_none() {
-                            out.observation = previous.observation.clone();
-                        }
+                        last_model = Some(out);
                     }
-                    last_model = Some(out);
+                    Ok(_) => chain.push((name, "fail".into())),
+                    Err(_) => chain.push((name, "error".into())),
                 }
-                Ok(_) => chain.push((name, "fail".into())),
-                Err(_) => chain.push((name, "error".into())),
             }
         }
         StrategyRoute {
@@ -861,16 +1128,12 @@ impl Kernel {
         name: &str,
         mut input: PluginInput,
     ) -> anyhow::Result<PluginOutput> {
+        // A caller may pre-fill `context` with a narrower view (e.g. the
+        // budgeted history of a model request); otherwise it is the full one.
         if self.native.contains(name) {
-            input.context = Some(
-                self.ctx
-                    .entries()
-                    .map(|e| ContextView {
-                        role: e.role.clone(),
-                        content: e.content.clone(),
-                    })
-                    .collect(),
-            );
+            if input.context.is_none() {
+                input.context = Some(context_view(&self.ctx.snapshot()));
+            }
             return self.native.invoke(name, &input);
         }
         let (module, caps, may_see_context) = {
@@ -880,22 +1143,21 @@ impl Kernel {
                 .ok_or_else(|| anyhow::anyhow!("plugin '{name}' not loaded"))?;
             (
                 p.module.clone(),
-                p.manifest.permissions.capabilities.clone(),
+                // A declared concurrency contract is enforced on every run,
+                // serial or batched: parallel strategies reach only their
+                // declared resources, pure ones reach nothing.
+                p.manifest
+                    .concurrency
+                    .effective_caps(&p.manifest.permissions.capabilities),
                 p.manifest.permissions.context,
             )
         };
         // Context crosses the sandbox boundary only when the signed manifest
         // declared it, and always as a copy.
-        if may_see_context {
-            input.context = Some(
-                self.ctx
-                    .entries()
-                    .map(|e| ContextView {
-                        role: e.role.clone(),
-                        content: e.content.clone(),
-                    })
-                    .collect(),
-            );
+        if !may_see_context {
+            input.context = None;
+        } else if input.context.is_none() {
+            input.context = Some(context_view(&self.ctx.snapshot()));
         }
         let result = self.runtime.invoke(
             &module,
@@ -906,25 +1168,125 @@ impl Kernel {
             self.cfg.plugin_fuel,
             self.cfg.plugin_memory_limit,
         );
-        let ok = matches!(&result, Ok(out) if out.ok || out.error.is_none());
-        {
-            let opts = ScanOptions {
-                plugins_dir: &self.plugins_dir,
-                pubkey: self.pubkey.as_ref(),
-                allow_unsigned: self.cfg.dev_allow_unsigned,
-            };
-            let rolled_back = self.registry.report_result(
-                &self.runtime,
-                &opts,
-                name,
-                ok,
-                self.cfg.plugin_max_failures,
-            );
-            if rolled_back {
-                self.pending_rollbacks.push(name.to_string());
+        self.report_wasm_result(name, &result);
+        result
+    }
+
+    /// Health accounting with auto-rollback for one wasm invocation.
+    fn report_wasm_result(&mut self, name: &str, result: &anyhow::Result<PluginOutput>) {
+        let ok = matches!(result, Ok(out) if out.ok || out.error.is_none());
+        let opts = ScanOptions {
+            plugins_dir: &self.plugins_dir,
+            pubkey: self.pubkey.as_ref(),
+            allow_unsigned: self.cfg.dev_allow_unsigned,
+        };
+        let rolled_back = self.registry.report_result(
+            &self.runtime,
+            &opts,
+            name,
+            ok,
+            self.cfg.plugin_max_failures,
+        );
+        if rolled_back {
+            self.pending_rollbacks.push(name.to_string());
+        }
+    }
+
+    /// Run one parallel batch of strategies on scoped threads. Inputs are
+    /// prepared up front exactly as `invoke_plugin` would (permission-
+    /// filtered context, contract-restricted capabilities); results come
+    /// back in batch order and wasm health is accounted afterwards in that
+    /// same order, so scheduling never changes observable kernel state.
+    fn invoke_strategies_parallel(
+        &mut self,
+        batch: &[String],
+        input: &PluginInput,
+    ) -> Vec<(String, anyhow::Result<PluginOutput>)> {
+        enum Job<'a> {
+            Native(&'a mut dyn NativePlugin, PluginInput),
+            Wasm(wasmtime::Module, Vec<String>, PluginInput),
+            Missing,
+        }
+        let full_context = context_view(&self.ctx.snapshot());
+        let natives: Vec<String> = batch
+            .iter()
+            .filter(|n| self.native.contains(n))
+            .cloned()
+            .collect();
+        let mut wasm_jobs = Vec::new();
+        for name in batch {
+            if natives.contains(name) {
+                wasm_jobs.push(None);
+                continue;
+            }
+            wasm_jobs.push(self.registry.get(name).map(|p| {
+                let mut job_input = input.clone();
+                if p.manifest.permissions.context {
+                    job_input.context = Some(full_context.clone());
+                }
+                (
+                    p.module.clone(),
+                    p.manifest
+                        .concurrency
+                        .effective_caps(&p.manifest.permissions.capabilities),
+                    job_input,
+                )
+            }));
+        }
+        let runtime = &self.runtime;
+        let bridge = self.bridge.clone();
+        let (fuel, memory_limit) = (self.cfg.plugin_fuel, self.cfg.plugin_memory_limit);
+        let mut native_handles = self.native.plugins_mut(&natives);
+        let jobs: Vec<Job> = batch
+            .iter()
+            .zip(wasm_jobs)
+            .map(|(name, wasm)| match native_handles.remove(name) {
+                Some(plugin) => {
+                    let mut job_input = input.clone();
+                    job_input.context = Some(full_context.clone());
+                    Job::Native(plugin, job_input)
+                }
+                None => match wasm {
+                    Some((module, caps, job_input)) => Job::Wasm(module, caps, job_input),
+                    None => Job::Missing,
+                },
+            })
+            .collect();
+        let outputs: Vec<anyhow::Result<PluginOutput>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = batch
+                .iter()
+                .zip(jobs)
+                .map(|(name, job)| {
+                    let bridge = bridge.clone();
+                    scope.spawn(move || match job {
+                        Job::Native(plugin, job_input) => plugin.handle(&job_input),
+                        Job::Wasm(module, caps, job_input) => runtime.invoke(
+                            &module,
+                            name,
+                            &caps,
+                            bridge,
+                            &job_input,
+                            fuel,
+                            memory_limit,
+                        ),
+                        Job::Missing => Err(anyhow::anyhow!("plugin '{name}' not loaded")),
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("strategy panicked")))
+                })
+                .collect()
+        });
+        for (name, result) in batch.iter().zip(&outputs) {
+            if !natives.contains(name) && self.registry.get(name).is_some() {
+                self.report_wasm_result(name, result);
             }
         }
-        result
+        batch.iter().cloned().zip(outputs).collect()
     }
 
     fn system_prompt(&self) -> String {
@@ -947,6 +1309,27 @@ impl Kernel {
             tool_names.join(", ")
         )
     }
+}
+
+/// Summarizer handed to compactors: routes through the kernel's own model.
+struct ModelSummarizer<'a> {
+    kernel: &'a mut Kernel,
+}
+
+impl Summarizer for ModelSummarizer<'_> {
+    fn summarize(&mut self, entries: &[ContextEntry], max_bytes: usize) -> anyhow::Result<String> {
+        self.kernel.summarize_with_model(entries, max_bytes)
+    }
+}
+
+fn context_view(entries: &[ContextEntry]) -> Vec<ContextView> {
+    entries
+        .iter()
+        .map(|e| ContextView {
+            role: e.role.clone(),
+            content: e.content.clone(),
+        })
+        .collect()
 }
 
 /// Build the multimodal user turn from an event payload. Accepted shapes:
@@ -1258,15 +1641,36 @@ mod tests {
     fn proactive_interaction_reaches_next_model_context() {
         struct Recorder;
         impl InferenceBackend for Recorder {
-            fn generate(&mut self, _: &str, context: &[crate::context::ContextEntry], _: &UserInput) -> anyhow::Result<String> {
-                assert!(context.iter().any(|e| e.role == "system" && e.content == "雷达报告跌倒"));
-                assert!(context.iter().any(|e| e.role == "assistant" && e.content == "你还好吗？"));
+            fn generate(
+                &mut self,
+                _: &str,
+                context: &[crate::context::ContextEntry],
+                _: &UserInput,
+            ) -> anyhow::Result<String> {
+                assert!(
+                    context
+                        .iter()
+                        .any(|e| e.role == "system" && e.content == "雷达报告跌倒")
+                );
+                assert!(
+                    context
+                        .iter()
+                        .any(|e| e.role == "assistant" && e.content == "你还好吗？")
+                );
                 Ok(r#"{"reply":"我听到了"}"#.into())
             }
         }
-        let mut kernel = Kernel::builder(Config::default()).backend(Box::new(Recorder)).build().unwrap();
+        let mut kernel = Kernel::builder(Config::default())
+            .backend(Box::new(Recorder))
+            .build()
+            .unwrap();
         kernel.remember_interaction("雷达报告跌倒", "你还好吗？");
-        let out = kernel.handle_event(Event {kind:"command".into(), payload:serde_json::json!("我没事"), priority:9, source:"test".into()});
+        let out = kernel.handle_event(Event {
+            kind: "command".into(),
+            payload: serde_json::json!("我没事"),
+            priority: 9,
+            source: "test".into(),
+        });
         assert_eq!(out.reply, "我听到了");
     }
 
@@ -1551,6 +1955,317 @@ mod tests {
         });
         let seen = seen.lock().unwrap();
         assert_eq!(*seen, vec!["kernel_start", "pre_task", "post_task"]);
+    }
+
+    fn command(text: &str) -> Event {
+        Event {
+            kind: "command".into(),
+            payload: serde_json::json!(text),
+            priority: 1,
+            source: "test".into(),
+        }
+    }
+
+    fn parallel(
+        side_effects: crate::plugin::manifest::SideEffects,
+        resources: &[&str],
+    ) -> Concurrency {
+        Concurrency {
+            parallel: true,
+            side_effects,
+            resources: resources.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn strategy_batches_follow_declarations_resources_and_limit() {
+        use crate::plugin::manifest::SideEffects;
+        let pass = |_: &PluginInput| Ok(PluginOutput::model());
+        let kernel = Kernel::builder(Config {
+            strategy_max_parallel: 2,
+            ..Default::default()
+        })
+        .register_strategy_with("a", parallel(SideEffects::None, &[]), pass)
+        .unwrap()
+        .register_strategy_with("b", parallel(SideEffects::Read, &["device:camera"]), pass)
+        .unwrap()
+        // Batch limit (2) reached: starts a new batch.
+        .register_strategy_with("c", parallel(SideEffects::None, &[]), pass)
+        .unwrap()
+        // Shares device:camera with nothing in c's batch... but d conflicts with e.
+        .register_strategy_with("d", parallel(SideEffects::Read, &["device:mic"]), pass)
+        .unwrap()
+        .register_strategy_with("e", parallel(SideEffects::Read, &["device:mic"]), pass)
+        .unwrap()
+        // Undeclared = black box = always alone.
+        .register_strategy("f", pass)
+        .register_strategy_with("g", parallel(SideEffects::None, &[]), pass)
+        .unwrap()
+        .build()
+        .unwrap();
+        let names = kernel.strategy_chain_names();
+        assert_eq!(names, vec!["a", "b", "c", "d", "e", "f", "g"]);
+        assert_eq!(
+            kernel.plan_strategy_batches(&names),
+            vec![
+                vec!["a", "b"],
+                vec!["c", "d"],
+                vec!["e"],
+                vec!["f"],
+                vec!["g"],
+            ]
+        );
+
+        let serial = Kernel::builder(Config {
+            strategy_max_parallel: 1,
+            ..Default::default()
+        })
+        .register_strategy_with("a", parallel(SideEffects::None, &[]), pass)
+        .unwrap()
+        .register_strategy_with("b", parallel(SideEffects::None, &[]), pass)
+        .unwrap()
+        .build()
+        .unwrap();
+        let names = serial.strategy_chain_names();
+        assert_eq!(
+            serial.plan_strategy_batches(&names),
+            vec![vec!["a"], vec!["b"]]
+        );
+    }
+
+    #[test]
+    fn write_side_effect_strategy_cannot_be_declared_parallel() {
+        use crate::plugin::manifest::SideEffects;
+        let built = Kernel::builder(Config::default()).register_strategy_with(
+            "actuator",
+            parallel(SideEffects::Write, &["device:relay"]),
+            |_: &PluginInput| Ok(PluginOutput::model()),
+        );
+        assert!(built.is_err());
+    }
+
+    #[test]
+    fn parallel_batch_runs_concurrently_but_folds_in_chain_order() {
+        use crate::plugin::manifest::SideEffects;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let probe = |delay_ms: u64, out: fn() -> PluginOutput| {
+            let in_flight = in_flight.clone();
+            let peak = peak.clone();
+            move |input: &PluginInput| {
+                assert!(input.context.is_some(), "native strategies see context");
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(out())
+            }
+        };
+        let mut kernel = Kernel::builder(Config::default())
+            // The slow first strategy passes on; the second answers. Both
+            // overlap, and the chain-order fold still lets "b" win.
+            .register_strategy_with(
+                "a-slow",
+                parallel(SideEffects::None, &[]),
+                probe(150, || {
+                    let mut out = PluginOutput::model();
+                    out.model_context = Some("from a".into());
+                    out
+                }),
+            )
+            .unwrap()
+            .register_strategy_with(
+                "b-fast",
+                parallel(SideEffects::None, &[]),
+                probe(10, || PluginOutput::rule("b wins")),
+            )
+            .unwrap()
+            .register_strategy_with(
+                "c-fast",
+                parallel(SideEffects::None, &[]),
+                probe(10, || PluginOutput::rule("c must not win")),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let out = kernel.handle_event(command("hi"));
+        assert_eq!(out.via, "rule");
+        assert_eq!(out.reply, "b wins");
+        assert!(
+            peak.load(Ordering::SeqCst) >= 2,
+            "batch members must overlap"
+        );
+    }
+
+    #[test]
+    fn parallel_strategy_panic_is_contained_as_an_error() {
+        use crate::plugin::manifest::SideEffects;
+        let mut kernel = Kernel::builder(Config::default())
+            .register_strategy_with(
+                "a-boom",
+                parallel(SideEffects::None, &[]),
+                |_: &PluginInput| -> anyhow::Result<PluginOutput> { panic!("boom") },
+            )
+            .unwrap()
+            .register_strategy_with(
+                "b-ok",
+                parallel(SideEffects::None, &[]),
+                |_: &PluginInput| Ok(PluginOutput::rule("still answered")),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let route = kernel.run_strategy(&command("x"), "route");
+        assert_eq!(route.winner.as_deref(), Some("b-ok"));
+        assert_eq!(route.chain[0], ("a-boom".to_string(), "error".to_string()));
+    }
+
+    /// Records the history each inference call received.
+    struct HistoryRecorder {
+        seen: Arc<std::sync::Mutex<Vec<Vec<ContextEntry>>>>,
+        summary: Option<&'static str>,
+    }
+
+    impl InferenceBackend for HistoryRecorder {
+        fn generate(
+            &mut self,
+            system: &str,
+            context: &[ContextEntry],
+            _input: &UserInput,
+        ) -> anyhow::Result<String> {
+            if system.starts_with("You compress conversation history") {
+                return match self.summary {
+                    Some(text) => Ok(text.into()),
+                    None => anyhow::bail!("summarizer offline"),
+                };
+            }
+            self.seen.lock().unwrap().push(context.to_vec());
+            Ok(r#"{"reply":"ok"}"#.into())
+        }
+    }
+
+    /// A kernel whose stored history is ~2KB while each request only has
+    /// room for a fraction of it.
+    fn budget_kernel(
+        summary: Option<&'static str>,
+        mode: CompactionMode,
+        compactor: Option<Box<dyn ContextCompactor>>,
+    ) -> (Kernel, Arc<std::sync::Mutex<Vec<Vec<ContextEntry>>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cfg = Config {
+            request_max_bytes: 1200,
+            response_reserve_bytes: 100,
+            context_compaction: mode,
+            compaction_keep_recent: 2,
+            ..Default::default()
+        };
+        let mut builder = Kernel::builder(cfg).backend(Box::new(HistoryRecorder {
+            seen: seen.clone(),
+            summary,
+        }));
+        builder.compactor_override = compactor;
+        let mut kernel = builder.build().unwrap();
+        for i in 0..10 {
+            kernel.remember_interaction(&format!("old-{i}:{}", "x".repeat(90)), "noted");
+        }
+        kernel.remember_interaction("recent fact", "recent reply");
+        (kernel, seen)
+    }
+
+    #[test]
+    fn over_budget_request_is_summarized_by_the_model_and_persisted() {
+        let (mut kernel, seen) =
+            budget_kernel(Some("用户聊过十件旧事"), CompactionMode::Summarize, None);
+        let out = kernel.handle_event(command("hello"));
+        assert_eq!(out.reply, "ok");
+        let sent = seen.lock().unwrap()[0].clone();
+        assert_eq!(sent[0].role, "system");
+        assert_eq!(sent[0].content, "早期对话摘要：用户聊过十件旧事");
+        assert_eq!(sent[1].content, "recent fact");
+        assert_eq!(sent[2].content, "recent reply");
+        assert_eq!(sent.len(), 3);
+        // The summary replaced the stored history too.
+        let stored = kernel.ctx.snapshot();
+        assert_eq!(stored[..3], sent[..]);
+    }
+
+    #[test]
+    fn failed_summary_falls_back_to_whole_message_eviction() {
+        let (mut kernel, seen) = budget_kernel(None, CompactionMode::Summarize, None);
+        let before = kernel.ctx.snapshot();
+        let out = kernel.handle_event(command("hello"));
+        assert_eq!(out.reply, "ok");
+        let sent = seen.lock().unwrap()[0].clone();
+        // A suffix of whole, untouched messages that fits the budget.
+        assert!(before.ends_with(&sent));
+        assert!(!sent.is_empty() && sent.len() < before.len());
+        let system = kernel.system_prompt();
+        let fixed = system.len() + "hello".len() + 100;
+        assert!(budget::history_cost(&sent) + fixed <= 1200);
+        // Eviction only shaped the request; the stored history was kept.
+        assert!(kernel.ctx.snapshot().starts_with(&before));
+    }
+
+    #[test]
+    fn evict_mode_never_asks_the_model_to_summarize() {
+        let (mut kernel, seen) =
+            budget_kernel(Some("should not be used"), CompactionMode::Evict, None);
+        kernel.handle_event(command("hello"));
+        let sent = seen.lock().unwrap()[0].clone();
+        assert!(
+            sent.iter()
+                .all(|e| !e.content.contains("should not be used"))
+        );
+    }
+
+    #[test]
+    fn custom_compactor_replaces_default_and_is_validated() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        // Returns an invalid role: the kernel must reject it and evict.
+        let bad = move |req: &CompactionRequest, _: &mut dyn Summarizer| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            assert!(req.budget_bytes > 0);
+            Ok(vec![ContextEntry {
+                role: "tool".into(),
+                content: "x".into(),
+            }])
+        };
+        let (mut kernel, seen) = budget_kernel(None, CompactionMode::Evict, Some(Box::new(bad)));
+        kernel.handle_event(command("hello"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "override beats evict mode");
+        let sent = seen.lock().unwrap()[0].clone();
+        assert!(sent.iter().all(|e| e.role != "tool"));
+
+        let good = |req: &CompactionRequest, _: &mut dyn Summarizer| {
+            Ok(req.entries[req.entries.len() - 1..].to_vec())
+        };
+        let (mut kernel, seen) = budget_kernel(None, CompactionMode::Evict, Some(Box::new(good)));
+        kernel.handle_event(command("hello"));
+        let sent = seen.lock().unwrap()[0].clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].content, "recent reply");
+    }
+
+    #[test]
+    fn request_that_cannot_fit_fails_explicitly_without_calling_the_model() {
+        let (mut kernel, seen) = budget_kernel(Some("s"), CompactionMode::Summarize, None);
+        let out = kernel.handle_event(command(&"y".repeat(2000)));
+        assert_eq!(out.status, "rejected");
+        assert!(out.reply.contains("exceeds budget"), "{}", out.reply);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn kernel_rejects_reserve_that_consumes_the_whole_budget() {
+        let cfg = Config {
+            request_max_bytes: 100,
+            response_reserve_bytes: 100,
+            ..Default::default()
+        };
+        assert!(Kernel::new(cfg, None).is_err());
     }
 
     #[test]

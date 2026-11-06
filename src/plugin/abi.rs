@@ -16,7 +16,7 @@
 use serde::{Deserialize, Serialize};
 
 /// What the kernel sends into the sandbox.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PluginInput {
     /// "tool" | "strategy" | "hook" | "infer" | "repair"
     /// (infer/repair are kernel-reserved invocations of tool-kind plugins
@@ -37,7 +37,7 @@ pub struct PluginInput {
     pub args: serde_json::Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ContextView {
     pub role: String,
     pub content: String,

@@ -88,7 +88,9 @@ impl Context {
         self.cur_bytes += role.len() + self.entries[index].content.len();
         while self.cur_bytes > self.max_bytes && self.entries.len() > 1 {
             if let Some(old) = self.entries.pop_front() {
-                self.cur_bytes = self.cur_bytes.saturating_sub(old.role.len() + old.content.len());
+                self.cur_bytes = self
+                    .cur_bytes
+                    .saturating_sub(old.role.len() + old.content.len());
             } else {
                 break;
             }
@@ -98,6 +100,29 @@ impl Context {
 
     pub fn entries(&self) -> impl Iterator<Item = &ContextEntry> {
         self.entries.iter()
+    }
+
+    /// Owned copy of the history, oldest first.
+    pub fn snapshot(&self) -> Vec<ContextEntry> {
+        self.entries.iter().cloned().collect()
+    }
+
+    /// Replace the whole history with a validated compaction result. The
+    /// hard cap still applies: oldest entries go first if it is exceeded.
+    pub fn replace_entries(&mut self, entries: Vec<ContextEntry>) {
+        self.entries = entries.into();
+        self.cur_bytes = self
+            .entries
+            .iter()
+            .map(|e| e.role.len() + e.content.len())
+            .sum();
+        while self.cur_bytes > self.max_bytes {
+            if let Some(old) = self.entries.pop_front() {
+                self.cur_bytes -= old.role.len() + old.content.len();
+            } else {
+                break;
+            }
+        }
     }
 
     pub fn byte_len(&self) -> usize {
@@ -112,8 +137,8 @@ impl Context {
         if !self.needs_compaction() {
             return None;
         }
-        let summary_prefix = "早期对话摘要：";
-        let summary_role = "system";
+        let summary_prefix = crate::budget::SUMMARY_PREFIX;
+        let summary_role = crate::budget::SUMMARY_ROLE;
         let summary_overhead = summary_role.len() + summary_prefix.len();
         let mut removed_bytes = 0;
         let mut count = 0;
@@ -150,8 +175,8 @@ impl Context {
         {
             return false;
         }
-        let summary_prefix = "早期对话摘要：";
-        let summary_role = "system";
+        let summary_prefix = crate::budget::SUMMARY_PREFIX;
+        let summary_role = crate::budget::SUMMARY_ROLE;
         let summary_overhead = summary_role.len() + summary_prefix.len();
         let summary = summary.trim();
         if summary.is_empty()
