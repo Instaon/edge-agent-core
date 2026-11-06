@@ -149,11 +149,13 @@ impl ContextCompactor for SummarizeCompactor {
             .checked_sub(fixed)
             .filter(|room| *room > 0)
             .ok_or_else(|| anyhow::anyhow!("recent turns alone exceed the history budget"))?;
+        anyhow::ensure!(old.iter().all(|e|e.label==old[0].label), "cross-owner summary forbidden");
         let summary = summarizer.summarize(old, room)?;
         let summary = summary.trim();
         anyhow::ensure!(!summary.is_empty(), "summarizer returned an empty summary");
         let mut out = Vec::with_capacity(recent.len() + 1);
         out.push(ContextEntry {
+            label: old[0].label.clone(),
             role: SUMMARY_ROLE.into(),
             content: format!("{SUMMARY_PREFIX}{summary}"),
         });
@@ -168,6 +170,7 @@ pub fn validate_compaction(
     result: &[ContextEntry],
     budget_bytes: usize,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(result.iter().all(|e| original.iter().any(|o|o.label==e.label)), "new ownership label in summary");
     let cost = history_cost(result);
     anyhow::ensure!(
         cost <= budget_bytes,
@@ -209,6 +212,7 @@ mod tests {
 
     fn e(role: &str, content: &str) -> ContextEntry {
         ContextEntry {
+            label: "anonymous".into(),
             role: role.into(),
             content: content.into(),
         }

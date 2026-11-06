@@ -325,6 +325,14 @@ impl Kernel {
         outcomes
     }
 
+    pub fn context_label(&self)->&str {self.ctx.current_label()}
+
+    pub fn set_context_scope(&mut self, label: &str, allowed: &[String]) {
+        self.ctx.set_scope(label, allowed);
+    }
+
+    pub fn set_context_view(&mut self,label:&str,allowed:&[String]){self.ctx.set_view(label,allowed,false);}
+
     pub fn context_needs_compaction(&self) -> bool {
         self.ctx.needs_compaction()
     }
@@ -672,7 +680,7 @@ impl Kernel {
     /// 规则保底 → 安全拒绝. The strategy plugin gets a chance to answer
     /// deterministically; otherwise the kernel refuses safely and says why.
     fn fallback(&mut self, event: &Event, reason: &str) -> TaskOutcome {
-        eprintln!("[kernel] degraded: {reason}");
+        eprintln!("[kernel] degraded: {}",crate::diagnostics::detail(reason));
         // The most important monitoring signal an edge device emits: the
         // deterministic chain had to leave the happy path, and why.
         self.run_hooks(
@@ -746,7 +754,7 @@ impl Kernel {
                 match result {
                     Ok(out) => Some(out),
                     Err(e) => {
-                        eprintln!("[kernel] context compaction failed, evicting: {e:#}");
+                        eprintln!("[kernel] context compaction failed, evicting: {}",crate::diagnostics::detail(format!("{e:#}")));
                         compactor_error = Some(format!("{e:#}"));
                         None
                     }
@@ -1100,7 +1108,7 @@ impl Kernel {
                 args: data.clone(),
             };
             if let Err(e) = self.invoke_plugin(&name, input) {
-                eprintln!("[kernel] hook '{name}'@{point} failed: {e:#}");
+                eprintln!("[kernel] hook '{name}'@{point} failed: {}",crate::diagnostics::detail(format!("{e:#}")));
             }
         }
     }
@@ -2229,6 +2237,7 @@ mod tests {
             counter.fetch_add(1, Ordering::SeqCst);
             assert!(req.budget_bytes > 0);
             Ok(vec![ContextEntry {
+                label: "anonymous".into(),
                 role: "tool".into(),
                 content: "x".into(),
             }])

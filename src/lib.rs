@@ -7,6 +7,7 @@ pub mod breaker;
 pub mod budget;
 pub mod config;
 pub mod context;
+pub mod diagnostics;
 pub mod event;
 pub mod inference;
 pub mod kernel;

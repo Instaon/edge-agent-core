@@ -263,6 +263,7 @@ mod tests {
     #[test]
     fn openai_messages_text_only_stays_string() {
         let ctx = vec![ContextEntry {
+            label: "anonymous".into(),
             role: "user".into(),
             content: "earlier".into(),
         }];
