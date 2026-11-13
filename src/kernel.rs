@@ -279,6 +279,23 @@ impl Kernel {
         self.ctx.needs_compaction()
     }
 
+    /// Host-managed conversations supply their own bounded context per event.
+    /// Return the previous context so unrelated events cannot inherit user data.
+    pub fn swap_context(&mut self, entries: &[crate::context::ContextEntry]) -> Context {
+        let mut context = Context::new(
+            self.cfg.context_max_bytes,
+            self.cfg.context_compact_threshold_percent,
+        );
+        for entry in entries {
+            context.push(&entry.role, &entry.content);
+        }
+        std::mem::replace(&mut self.ctx, context)
+    }
+
+    pub fn restore_context(&mut self, context: Context) {
+        self.ctx = context;
+    }
+
     pub fn context_compaction_candidate(&self) -> Option<ContextCompaction> {
         self.ctx.compaction_candidate()
     }
