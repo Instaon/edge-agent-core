@@ -33,13 +33,18 @@
 
 这是"内核只提供机制，不提供策略"最直接的例子：队列结构（机制）是内核的，排序权重的语义（策略）是业务的。
 
-## 2. 上下文（[context.rs](../src/context.rs)）
+## 2. 上下文与请求预算（[context.rs](../src/context.rs)、[budget.rs](../src/budget.rs)）
 
-**理念**：内存预算是硬约束，不是建议。
+**理念**：内存预算与完整模型请求预算是硬约束，不是建议。
 
 `Context` 是一个有硬字节上限的双端队列，默认 8KB。达到 `context_compact_threshold_percent`（默认 75%，即 6KB）后，宿主可在闲时取出 `Kernel::context_compaction_candidate`，在后台摘要早期条目（包括已有摘要），再通过 `Kernel::apply_context_summary` 用一条 system 摘要替换；最近两条保持原文。内核校验候选前缀仍未变化、摘要字节数、节省量和水位，失败时原文不变。实时路径仍只做预算检查：突发超限从队首丢最旧条目，单条超大条目截断。
 
-摘要内容由宿主决定；内核只提供可验证的替换机制。无论摘要器是否可用，**内存占用始终受硬上限约束**。
+除历史队列上限外，每次发起模型请求前，内核都会按 `request_max_bytes`（含 `response_reserve_bytes` 输出预留、system prompt、本轮输入与图片开销）统一检查**完整请求预算**：
+
+1. 若当前历史加上固定开销未超限，直接发送；
+2. 若超限，触发可配置的上下文压缩器（支持 `context_compaction: "summarize" | "evict"` 外部配置，或通过 `KernelBuilder::compactor` 注入自定义压缩函数；默认摘要旧历史并保留最近 `compaction_keep_recent` 条原文），并对压缩产出的角色、非空性、缩减量与目标预算做严格校验；
+3. 压缩失败或校验不过时，自动退化为按**完整旧消息**从队首淘汰（绝不截断半条消息）；
+4. 若清空全部历史后仅本轮请求自身仍超出预算，则以 `BudgetExceeded` 明确失败并走降级链，绝不把超限请求发给后端。
 
 ## 3. 资源锁（[lock.rs](../src/lock.rs)）
 

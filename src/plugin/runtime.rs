@@ -67,7 +67,7 @@ impl PluginRuntime {
             |mut caller: Caller<'_, StoreData>, ptr: i32, len: i32| {
                 let msg = read_guest_bytes(&mut caller, ptr, len).unwrap_or_default();
                 let name = caller.data().plugin_name.clone();
-                eprintln!("[plugin:{name}] {}", String::from_utf8_lossy(&msg));
+                eprintln!("[plugin:{name}] {}", crate::diagnostics::detail(String::from_utf8_lossy(&msg)));
             },
         )?;
 

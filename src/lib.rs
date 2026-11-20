@@ -4,18 +4,22 @@
 //! real hardware capabilities, pushes `Event`s and drains outcomes.
 
 pub mod breaker;
+pub mod budget;
 pub mod config;
 pub mod context;
+pub mod diagnostics;
 pub mod event;
 pub mod inference;
 pub mod kernel;
 pub mod lock;
 pub mod plugin;
 
+pub use budget::{BudgetExceeded, CompactionRequest, ContextCompactor, Summarizer};
 pub use config::Config;
 pub use event::Event;
 pub use inference::{ImagePart, InferenceBackend, UserInput};
 pub use kernel::{Kernel, KernelBuilder, TaskOutcome};
 pub use plugin::abi::{PluginInput, PluginOutput};
+pub use plugin::manifest::{Concurrency, SideEffects};
 pub use plugin::native::{NativePlugin, NativeRegistry};
 pub use plugin::runtime::HostBridge;

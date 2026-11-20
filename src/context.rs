@@ -5,11 +5,14 @@ use std::collections::VecDeque;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ContextEntry {
+    pub label: String,
     pub role: String, // "user" | "assistant" | "system"
     pub content: String,
 }
 
 pub struct ContextCompaction {
+    revision: u64,
+    label: String,
     entries: Vec<ContextEntry>,
     max_summary_bytes: usize,
     removed_bytes: usize,
@@ -26,6 +29,9 @@ impl ContextCompaction {
 }
 
 pub struct Context {
+    allowed: Vec<String>,
+    label: String,
+    revision: u64,
     entries: VecDeque<ContextEntry>,
     max_bytes: usize,
     compact_threshold_bytes: usize,
@@ -35,12 +41,37 @@ pub struct Context {
 impl Context {
     pub fn new(max_bytes: usize, compact_threshold_percent: u8) -> Self {
         Self {
+            allowed: vec!["anonymous".into()],
+            label: "anonymous".into(),
+            revision: 0,
             entries: VecDeque::new(),
             max_bytes,
             compact_threshold_bytes: max_bytes.saturating_mul(compact_threshold_percent as usize)
                 / 100,
             cur_bytes: 0,
         }
+    }
+
+    /// Host-selected labels are the isolation boundary. A switch invalidates in-flight summaries.
+    pub fn current_label(&self)->&str {&self.label}
+
+    pub fn set_scope(&mut self, label: &str, allowed: &[String]) {
+        self.set_view(label, allowed, true);
+    }
+
+    /// Background views can temporarily hide a person's history without deleting it.
+    pub fn set_view(&mut self, label: &str, allowed: &[String], discard_hidden: bool) {
+        self.revision = self.revision.wrapping_add(1);
+        self.label = label.to_string();
+        self.allowed = allowed.to_vec();
+        if discard_hidden {
+            self.entries.retain(|e| allowed.contains(&e.label));
+        }
+        self.cur_bytes = self
+            .entries
+            .iter()
+            .map(|e| e.role.len() + e.content.len())
+            .sum();
     }
 
     pub fn push(&mut self, role: &str, content: &str) {
@@ -58,6 +89,7 @@ impl Context {
         };
         self.cur_bytes += role.len() + content.len();
         self.entries.push_back(ContextEntry {
+            label: self.label.clone(),
             role: role.into(),
             content: content.into(),
         });
@@ -77,7 +109,7 @@ impl Context {
         let Some(index) = self.entries.iter().rposition(|entry| entry.role == role) else {
             return false;
         };
-        if index + 1 != self.entries.len() {
+        if index + 1 != self.entries.len() || self.entries[index].label != self.label {
             return false;
         }
         let old_cost = self.entries[index].role.len() + self.entries[index].content.len();
@@ -88,7 +120,9 @@ impl Context {
         self.cur_bytes += role.len() + self.entries[index].content.len();
         while self.cur_bytes > self.max_bytes && self.entries.len() > 1 {
             if let Some(old) = self.entries.pop_front() {
-                self.cur_bytes = self.cur_bytes.saturating_sub(old.role.len() + old.content.len());
+                self.cur_bytes = self
+                    .cur_bytes
+                    .saturating_sub(old.role.len() + old.content.len());
             } else {
                 break;
             }
@@ -97,7 +131,43 @@ impl Context {
     }
 
     pub fn entries(&self) -> impl Iterator<Item = &ContextEntry> {
-        self.entries.iter()
+        self.entries
+            .iter()
+            .filter(|e| self.allowed.contains(&e.label))
+    }
+
+    /// Owned copy of the history, oldest first.
+    pub fn snapshot(&self) -> Vec<ContextEntry> {
+        self.entries().cloned().collect()
+    }
+
+    /// Replace the whole history with a validated compaction result. The
+    /// hard cap still applies: oldest entries go first if it is exceeded.
+    pub fn replace_entries(&mut self, entries: Vec<ContextEntry>) {
+        let mut hidden: VecDeque<_> = self
+            .entries
+            .iter()
+            .filter(|e| !self.allowed.contains(&e.label))
+            .cloned()
+            .collect();
+        hidden.extend(
+            entries
+                .into_iter()
+                .filter(|e| self.allowed.contains(&e.label)),
+        );
+        self.entries = hidden;
+        self.cur_bytes = self
+            .entries
+            .iter()
+            .map(|e| e.role.len() + e.content.len())
+            .sum();
+        while self.cur_bytes > self.max_bytes {
+            if let Some(old) = self.entries.pop_front() {
+                self.cur_bytes -= old.role.len() + old.content.len();
+            } else {
+                break;
+            }
+        }
     }
 
     pub fn byte_len(&self) -> usize {
@@ -109,11 +179,16 @@ impl Context {
     }
 
     pub fn compaction_candidate(&self) -> Option<ContextCompaction> {
-        if !self.needs_compaction() {
+        if !self.needs_compaction()
+            || self
+                .entries
+                .iter()
+                .any(|e| !self.allowed.contains(&e.label))
+        {
             return None;
         }
-        let summary_prefix = "早期对话摘要：";
-        let summary_role = "system";
+        let summary_prefix = crate::budget::SUMMARY_PREFIX;
+        let summary_role = crate::budget::SUMMARY_ROLE;
         let summary_overhead = summary_role.len() + summary_prefix.len();
         let mut removed_bytes = 0;
         let mut count = 0;
@@ -123,6 +198,9 @@ impl Context {
                 > self.compact_threshold_bytes
         {
             let entry = &self.entries[count];
+            if entry.label != self.entries[0].label {
+                break;
+            }
             removed_bytes += entry.role.len() + entry.content.len();
             count += 1;
         }
@@ -135,6 +213,8 @@ impl Context {
             self.compact_threshold_bytes - (self.cur_bytes - removed_bytes) - summary_overhead,
         );
         Some(ContextCompaction {
+            revision: self.revision,
+            label: self.entries[0].label.clone(),
             entries: self.entries.iter().take(count).cloned().collect(),
             max_summary_bytes: budget,
             removed_bytes,
@@ -142,6 +222,9 @@ impl Context {
     }
 
     pub fn apply_summary(&mut self, candidate: &ContextCompaction, summary: &str) -> bool {
+        if candidate.revision != self.revision {
+            return false;
+        }
         if !self
             .entries
             .iter()
@@ -150,8 +233,8 @@ impl Context {
         {
             return false;
         }
-        let summary_prefix = "早期对话摘要：";
-        let summary_role = "system";
+        let summary_prefix = crate::budget::SUMMARY_PREFIX;
+        let summary_role = crate::budget::SUMMARY_ROLE;
         let summary_overhead = summary_role.len() + summary_prefix.len();
         let summary = summary.trim();
         if summary.is_empty()
@@ -166,6 +249,7 @@ impl Context {
             self.entries.pop_front();
         }
         self.entries.push_front(ContextEntry {
+            label: candidate.label.clone(),
             role: summary_role.into(),
             content: format!("{summary_prefix}{summary}"),
         });
@@ -327,5 +411,55 @@ mod tests {
         let before: Vec<_> = ctx.entries().cloned().collect();
         assert!(!ctx.apply_summary(&candidate, "早期偏好"));
         assert_eq!(ctx.entries().cloned().collect::<Vec<_>>(), before);
+    }
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+    #[test]
+    fn identity_switch_preserves_anonymous_and_removes_previous_person() {
+        let mut c = Context::new(1000, 75);
+        let anon = "anonymous:conversation".to_string();
+        let a = "person:a".to_string();
+        let b = "person:b".to_string();
+        c.set_scope(&anon, std::slice::from_ref(&anon));
+        c.push("user", "turn on lamp");
+        c.set_scope(&a, &[anon.clone(), a.clone()]);
+        c.push("user", "ALICE_PRIVATE");
+        c.set_scope(&b, &[anon, b.clone()]);
+        assert!(c.snapshot().iter().any(|x| x.content == "turn on lamp"));
+        assert!(!c.snapshot().iter().any(|x| x.content == "ALICE_PRIVATE"));
+    }
+    #[test]
+    fn scope_change_rejects_late_summary_even_if_prefix_unchanged() {
+        let mut c = Context::new(100, 75);
+        for text in ["老对话甲甲甲甲", "老对话乙乙乙乙", "最近问题", "最近回答"]
+        {
+            c.push("user", text);
+        }
+        let candidate = c.compaction_candidate().unwrap();
+        c.set_scope("anonymous", &["anonymous".into()]);
+        assert!(!c.apply_summary(&candidate, "迟到摘要"));
+    }
+}
+
+#[cfg(test)]
+mod background_isolation_tests {
+    use super::*;
+    #[test]
+    fn background_view_cannot_read_or_compact_person_but_does_not_destroy_dialogue() {
+        let mut c = Context::new(300, 75);
+        c.set_scope("person:a", &["person:a".into()]);
+        c.push("user", "A_PRIVATE");
+        c.set_view("space:living", &["space:living".into()], false);
+        assert!(c.snapshot().is_empty());
+        assert!(c.compaction_candidate().is_none());
+        c.push("system", "lamp on");
+        c.replace_entries(vec![]);
+        c.set_scope("person:a", &["person:a".into(), "space:living".into()]);
+        assert_eq!(c.snapshot()[0].content, "A_PRIVATE");
+        c.set_scope("person:b", &["person:b".into(), "space:living".into()]);
+        assert!(!c.snapshot().iter().any(|e| e.content == "A_PRIVATE"));
     }
 }

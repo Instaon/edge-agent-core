@@ -16,6 +16,24 @@ pub struct Config {
     pub max_tool_steps: u32,
     /// Explicit ordering for named strategy interceptors; other plugins retain their order.
     pub strategy_order: Vec<String>,
+    /// Max strategies the kernel runs concurrently in one batch. Only
+    /// strategies that declare a parallel-safe concurrency contract are
+    /// batched; 1 disables parallel scheduling entirely.
+    pub strategy_max_parallel: usize,
+    /// Byte budget of one complete model request: system prompt + history +
+    /// current input (+ images at `request_image_cost_bytes` each) + the
+    /// output reserve. Checked by the kernel before every inference call.
+    pub request_max_bytes: usize,
+    /// Bytes reserved inside `request_max_bytes` for the model's answer.
+    pub response_reserve_bytes: usize,
+    /// Budget charged per attached image (images are not measured by bytes).
+    pub request_image_cost_bytes: usize,
+    /// What the kernel does when a request exceeds its budget. Whatever the
+    /// mode, a failed or invalid compaction falls back to evicting whole
+    /// oldest messages, and a request that still does not fit fails loudly.
+    pub context_compaction: CompactionMode,
+    /// Newest history entries the default summarizer keeps verbatim.
+    pub compaction_keep_recent: usize,
     /// Consecutive task failures before the kernel enters fallback-only mode.
     pub breaker_max_failures: u32,
     /// Identical consecutive actions treated as a dead loop.
@@ -36,6 +54,17 @@ pub struct Config {
     /// DEV ONLY: load unsigned plugins. Zero-trust default is off.
     pub dev_allow_unsigned: bool,
     pub backend: BackendConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionMode {
+    /// Summarize old history with the model, keep recent turns verbatim.
+    /// A compactor injected via `KernelBuilder::compactor` replaces this.
+    #[default]
+    Summarize,
+    /// Skip summarization; only evict whole oldest messages.
+    Evict,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -83,6 +112,12 @@ impl Default for Config {
             max_format_retries: 2,
             max_tool_steps: 6,
             strategy_order: Vec::new(),
+            strategy_max_parallel: 4,
+            request_max_bytes: 32 * 1024,
+            response_reserve_bytes: 1024,
+            request_image_cost_bytes: 1024,
+            context_compaction: CompactionMode::Summarize,
+            compaction_keep_recent: 4,
             breaker_max_failures: 3,
             breaker_max_repeats: 3,
             plugin_fuel: 50_000_000,
@@ -114,6 +149,11 @@ mod tests {
         assert_eq!(cfg.context_max_bytes, 8 * 1024);
         assert_eq!(cfg.context_compact_threshold_percent, 75);
         assert_eq!(cfg.max_format_retries, 2);
+        assert_eq!(cfg.strategy_max_parallel, 4);
+        assert_eq!(cfg.request_max_bytes, 32 * 1024);
+        assert_eq!(cfg.response_reserve_bytes, 1024);
+        assert_eq!(cfg.context_compaction, CompactionMode::Summarize);
+        assert_eq!(cfg.compaction_keep_recent, 4);
         assert_eq!(cfg.breaker_max_failures, 3);
         assert_eq!(cfg.breaker_max_repeats, 3);
         assert_eq!(cfg.plugin_fuel, 50_000_000);
@@ -131,6 +171,19 @@ mod tests {
         }"#;
         let cfg: Config = serde_json::from_str(json_mock).unwrap();
         assert!(matches!(cfg.backend, BackendConfig::Mock));
+
+        // Budget and compaction are externally configurable.
+        let json_budget = r#"{
+            "request_max_bytes": 4096,
+            "response_reserve_bytes": 512,
+            "context_compaction": "evict",
+            "strategy_max_parallel": 1
+        }"#;
+        let cfg: Config = serde_json::from_str(json_budget).unwrap();
+        assert_eq!(cfg.request_max_bytes, 4096);
+        assert_eq!(cfg.response_reserve_bytes, 512);
+        assert_eq!(cfg.context_compaction, CompactionMode::Evict);
+        assert_eq!(cfg.strategy_max_parallel, 1);
 
         // 2. OpenAI Backend
         let json_openai = r#"{

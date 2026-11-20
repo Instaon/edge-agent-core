@@ -239,6 +239,7 @@ fn load_version(
         manifest.version,
         expected_version
     );
+    manifest.validate()?;
 
     // 零信任验签: mandatory unless explicitly in dev mode.
     match (opts.pubkey, opts.allow_unsigned) {
